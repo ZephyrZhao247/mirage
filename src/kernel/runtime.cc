@@ -333,6 +333,7 @@ void register_mugraph(
       std::map<dim3, TaskId, Dim3Comparator> cur_task_map;
       cur_task_map = add_events_for_denpendency(allgather_tasks, false /*nvshmem_event*/);
       pre_task_map = cur_task_map;
+      pre_op = cur_op;
       // Currently, we assume that the output of the previous op is not copied
       // into the allreduce buffer, residing in input_ops[0], so we do not need to
       // set pre_output_ops to output_ops of current op.
