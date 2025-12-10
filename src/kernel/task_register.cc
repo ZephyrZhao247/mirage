@@ -692,9 +692,6 @@ int TaskRegister::register_reduce_task(threadblock::Graph const &bgraph,
   kn::KNInputOp *kn_input_op = static_cast<kn::KNInputOp *>(
     output_ops[0]->dtensor.owner_op);
   int output_stride = static_cast<int>(kn_input_op->input_strides[0]);
-  unsigned world_size = params[0];
-  unsigned my_gpu_id = params[1];
-  unsigned num_elements = input_ops[0]->dtensor.num_elements();
 
   // Register nvshmem copy task (allgather)
   mirage::transpiler::CodeKeeper c;
@@ -707,20 +704,15 @@ int TaskRegister::register_reduce_task(threadblock::Graph const &bgraph,
   // c.e("assert(gpu_id < runtime_config.num_gpus);");
   // c.e("assert(gpu_id != runtime_config.my_gpu_id);");
   // Column major
-  c.e("for (int i = 0; i < $; i++) {", world_size);
-  c.e("if (i == $) continue;", my_gpu_id);
   c.e("nvshmemx_putmem_signal_block(");
-  c.e("    reinterpret_cast<char*>(task_desc->output_ptrs[0]) + i * $ * 2, // "
-      "bfloat16",
-      num_elements);
+  c.e("    reinterpret_cast<char*>(task_desc->output_ptrs[0]),");
   c.e("    reinterpret_cast<char*>(task_desc->input_ptrs[0]),");
   c.e("    task_desc->task_metadata.xfer_size_in_bytes,");
   c.e("    reinterpret_cast<uint64_t "
       "*>(&runtime_config.all_event_counters[event_index]),");
   c.e("    1 /*signal*/,");
   c.e("    NVSHMEM_SIGNAL_ADD,");
-  c.e("    i);");
-  c.e("}");
+  c.e("    gpu_id);");
   register_task_variant(TASK_NVSHMEM_COPY, c.to_string());
   // Register reduction kernel
 
