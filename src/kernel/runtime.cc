@@ -870,11 +870,7 @@ TaskGraphResult print_task_graph(
           for (bid.z = 0; bid.z < bgraph.grid_dim.z; bid.z++) {
             // To perform allreduce, we first launch (num_gpus-1) tasks for
             // allgather
-            // TODO(Zepeng) Coalesce allgather tasks into a single massive task
-            for (int tgt_gpu_id = 0; tgt_gpu_id < num_gpus; tgt_gpu_id++) {
-              if (tgt_gpu_id == my_gpu_id) {
-                continue;
-              }
+            {
               FullTaskDesc task_desc = all_tasks[task_pos];
               assert(task_desc.task_type == TASK_NVSHMEM_COPY);
               tgbody.e("// task[$]", task_pos);
@@ -954,7 +950,8 @@ TaskGraphResult print_task_graph(
                   {"strides", json_strides}});
               // Add nvshmem_copy output
               // Note that nvshmem_copy's output is stored in input_ops[1]
-              offset = my_gpu_id * input_ops[0]->dtensor.num_elements();
+              // The per-GPU offset calculation is done at runtime.
+              offset = 0;
               int3 output_map = input_ops[1]->input_map;
               io_desc = io_configs.find(input_ops[1]->dtensor.guid)->second;
               if (output_map.x >= 0) {
