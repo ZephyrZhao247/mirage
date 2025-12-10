@@ -103,8 +103,21 @@ void dfs_create_events_add_tasks(
         for (bid.z = producer_lo_bid.z; bid.z < producer_hi_bid.z; bid.z++) {
           assert(pre_task_map.find(bid) != pre_task_map.end());
           std::vector<TaskId> const &task_ids = pre_task_map.find(bid)->second;
-          for (auto const &task_id : task_ids) {  
-            all_tasks[task_id].trigger_event = get_event_id(
+          if (task_ids.size() > 1) {
+            // The previous task is a multigpu task, we should set gpu_id accordingly
+            assert(task_ids.size() == (size_t)num_gpus - 1);
+            for (int tgt_gpu_id = 0; tgt_gpu_id < num_gpus; tgt_gpu_id++) {  
+              if (tgt_gpu_id == my_gpu_id) {
+                continue;
+              }
+              size_t idx = tgt_gpu_id < my_gpu_id ? tgt_gpu_id : tgt_gpu_id - 1;
+              all_tasks[task_ids[idx]].trigger_event = get_event_id(
+                  tgt_gpu_id, all_events.size(), nvshmem_event /*nvshmem_event*/);
+              event_desc.num_triggers++;
+            }
+          } else {
+            assert(task_ids.size() == 1);
+            all_tasks[task_ids[0]].trigger_event = get_event_id(
                 my_gpu_id, all_events.size(), nvshmem_event /*nvshmem_event*/);
             event_desc.num_triggers++;
           }
@@ -330,14 +343,19 @@ void register_mugraph(
       for (bid.x = 0; bid.x < bgraph.grid_dim.x; bid.x++) {
         for (bid.y = 0; bid.y < bgraph.grid_dim.y; bid.y++) {
           for (bid.z = 0; bid.z < bgraph.grid_dim.z; bid.z++) {
-            FullTaskDesc task(TASK_NVSHMEM_COPY, 0 /*variant_id*/);
-            //  Initialize input tensors to the task
-            TensorDesc input_desc = get_tensor_desc(input_ops[0]);
-            task.inputs[task.num_inputs++] = input_desc;
-            // Initialize output tensors to the task
-            TensorDesc output_desc = get_tensor_desc(input_ops[1]);
-            task.outputs[task.num_outputs++] = output_desc;
-            allgather_tasks.push_back(task);
+            for (int i = 0; i < num_gpus; i++) {
+              if (i == my_gpu_id) {
+                continue;
+              }
+              FullTaskDesc task(TASK_NVSHMEM_COPY, 0 /*variant_id*/);
+              //  Initialize input tensors to the task
+              TensorDesc input_desc = get_tensor_desc(input_ops[0]);
+              task.inputs[task.num_inputs++] = input_desc;
+              // Initialize output tensors to the task
+              TensorDesc output_desc = get_tensor_desc(input_ops[1]);
+              task.outputs[task.num_outputs++] = output_desc;
+              allgather_tasks.push_back(task);
+            }
           } // for bid.z
         }   // for bid.y
       }     // for bid.x
