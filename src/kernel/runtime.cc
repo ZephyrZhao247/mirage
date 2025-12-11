@@ -368,8 +368,14 @@ void register_mugraph(
       // Currently, we assume that the output of the previous op is not copied
       // into the allreduce buffer, residing in input_ops[0], so we do not need to
       // set pre_output_ops to output_ops of current op.
+      std::map<dim3, std::vector<TaskId>, Dim3Comparator> cur_task_map_new;
+      cur_task_map_new.clear();
 
-      decltype(allgather_tasks) reduce_tasks;
+      // dummy event
+      EventDesc dummy_event;
+      dummy_event.num_triggers = 0;
+      dummy_event.first_task_id = all_tasks.size();
+
       // Currently, the allgather and reduce tasks are of the same grid_dim
       for (bid.x = 0; bid.x < bgraph.grid_dim.x; bid.x++) {
         for (bid.y = 0; bid.y < bgraph.grid_dim.y; bid.y++) {
@@ -382,20 +388,40 @@ void register_mugraph(
             }
             TensorDesc desc = get_tensor_desc(output_ops[0]);
             task.outputs[task.num_outputs++] = desc;
-            reduce_tasks.push_back(task);
+            cur_task_map_new[bid] = std::vector<TaskId>{all_tasks.size()};
+            all_tasks.push_back(task);
           }
         }
       }
+      dummy_event.last_task_id = all_tasks.size();
+      for (auto const &it: pre_task_map) {
+        for (int tgt_gpu_id = 0; tgt_gpu_id < num_gpus; tgt_gpu_id++) {
+          if (tgt_gpu_id == my_gpu_id) {
+            continue;
+          }
+          dummy_event.num_triggers++;
+          int idx = tgt_gpu_id < my_gpu_id ? tgt_gpu_id : tgt_gpu_id - 1;
+          all_tasks[it.second[idx]].trigger_event =
+              get_event_id(tgt_gpu_id, all_events.size(), true /*nvshmem_event*/);
+        }
+      }
+      nvshmem_events_idx.insert(all_events.size());
+      dummy_event.event_type =
+        dummy_event.last_task_id >= dummy_event.first_task_id + 8
+            ? EVENT_LAUNCH_MASSIVE_TASKS
+            : EVENT_LAUNCH_TASKS;
+      all_events.push_back(dummy_event);
+      assert(dummy_event.num_triggers == bid.x * bid.y * bid.z * (num_gpus - 1));
       // Add dependency between allgather tasks and reduce tasks
       // Note: The reduce tasks are triggered by nvshmem events
-      cur_task_map = add_events_for_denpendency(reduce_tasks, true, false);
+      // cur_task_map = add_events_for_denpendency(reduce_tasks, true, false);
 
       pre_output_ops = output_ops;
       pre_op = cur_op;
-      pre_task_map = cur_task_map;
+      pre_task_map = cur_task_map_new;
       
       std::map<dim3, TaskId, Dim3Comparator> cur_task_map_single;
-      for (auto const &it : cur_task_map) {
+      for (auto const &it : cur_task_map_new) {
         // The reduce task should be the only task for each bid
         assert(it.second.size() == 1);
         cur_task_map_single[it.first] = it.second[0];

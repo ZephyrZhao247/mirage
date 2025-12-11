@@ -23,16 +23,16 @@ template <typename T,
           int OUTPUT_SIZE>
 __device__ __forceinline__ void identity_task_impl(void const *input_ptr,
                                                    void *output_ptr) {
-  T const *__restrict__ d_input = static_cast<T const *>(input_ptr);
-  T *__restrict__ d_output = static_cast<T *>(output_ptr);
+//   T const *__restrict__ d_input = static_cast<T const *>(input_ptr);
+//   T *__restrict__ d_output = static_cast<T *>(output_ptr);
 
-#pragma unroll
-  for (int i = threadIdx.x; i < OUTER_DIM_SIZE * OUTPUT_SIZE; i += blockDim.x) {
-    int outer_dim_idx = i / OUTPUT_SIZE;
-    int inner_dim_idx = i % OUTPUT_SIZE;
-    d_output[outer_dim_idx * OUTER_DIM_STRIDE + inner_dim_idx] =
-        d_input[outer_dim_idx * OUTER_DIM_STRIDE + inner_dim_idx];
-  }
+// #pragma unroll
+//   for (int i = threadIdx.x; i < OUTER_DIM_SIZE * OUTPUT_SIZE; i += blockDim.x) {
+//     int outer_dim_idx = i / OUTPUT_SIZE;
+//     int inner_dim_idx = i % OUTPUT_SIZE;
+//     d_output[outer_dim_idx * OUTER_DIM_STRIDE + inner_dim_idx] =
+//         d_input[outer_dim_idx * OUTER_DIM_STRIDE + inner_dim_idx];
+//   }
 }
 
 } // namespace kernel
