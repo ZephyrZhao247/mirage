@@ -139,6 +139,20 @@ public:
       threadblock::Graph const &bgraph, std::vector<int> const &params);
   int register_nvshmem_tile_allreduce_task(threadblock::Graph const &bgraph,
                                            std::vector<int> const &params);
+  int register_nvshmem_tile_allgather_task(threadblock::Graph const &bgraph,
+                                           std::vector<int> const &params);
+  int register_nvshmem_reducescatter_put_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_reducescatter_reduction_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_nvshmem_alltoall_put_task(threadblock::Graph const &bgraph,
+                                         std::vector<int> const &params);
+  int register_nvshmem_broadcast_put_task(threadblock::Graph const &bgraph,
+                                          std::vector<int> const &params);
+  int register_nvshmem_broadcast_recv_task(threadblock::Graph const &bgraph,
+                                           std::vector<int> const &params);
+  int register_nvshmem_tile_broadcast_task(threadblock::Graph const &bgraph,
+                                           std::vector<int> const &params);
   // Multi-GPU tasks end
   int register_task_variant(TaskType type, std::string const &code);
 

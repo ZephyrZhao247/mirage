@@ -3630,5 +3630,329 @@ int TaskRegister::register_nvshmem_tile_allreduce_task(
   return register_task_variant(TASK_NVSHMEM_TILE_ALLREDUCE, c.to_string());
 }
 
+int TaskRegister::register_nvshmem_tile_allgather_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_gpus
+  // params[1]: my_gpu_id
+  assert(params.size() == 2);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 1;
+  int num_outputs = 1;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  assert(input_ops[0]->input_map.x == 1 && input_ops[0]->input_map.y == -1 &&
+         input_ops[0]->input_map.z == -1);
+  // input: 2D (batch_size, hidden), output: 3D (world_size, batch_size, hidden)
+  assert(input_ops[0]->output_tensors[0].num_dims == 2);
+  assert(output_ops[0]->output_tensors[0].num_dims == 3);
+  int batch_size = input_ops[0]->output_tensors[0].dim[0];
+  int output_size = input_ops[0]->output_tensors[0].dim[1];
+  kn::KNInputOp *kn_input_op =
+      static_cast<kn::KNInputOp *>(input_ops[0]->dtensor.owner_op);
+  int output_stride = static_cast<int>(kn_input_op->input_strides[0]);
+
+  mirage::transpiler::CodeKeeper c;
+  c.inc_indent();
+  c.e("nvshmem_tile_allgather<__nv_bfloat16, $, $, $, $>(",
+      params[0],
+      batch_size,
+      output_size,
+      output_stride);
+  c.e("  task_desc->input_ptrs[0],");
+  c.e("  task_desc->output_ptrs[0],");
+  c.e("  runtime_config.nvshmem_teams,");
+  c.e("  task_desc->task_metadata.task_offset,");
+  c.e("  runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS]);");
+  return register_task_variant(TASK_NVSHMEM_TILE_ALLGATHER, c.to_string());
+}
+
+int TaskRegister::register_nvshmem_reducescatter_put_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_gpus
+  // params[1]: my_gpu_id
+  assert(params.size() == 2);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  // input[0]: local data (world_size, batch_size, hidden_size) - 3D
+  // output[0]: buffer on target GPU (world_size, batch_size, hidden_size) - 3D
+  int num_inputs = 1;
+  int num_outputs = 1;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  assert(input_ops[0]->input_map.x == 1 && input_ops[0]->input_map.y == -1 &&
+         input_ops[0]->input_map.z == -1);
+  // Both input and output are 3D: (world_size, batch_size, hidden_size)
+  assert(input_ops[0]->output_tensors[0].num_dims == 3);
+  assert(output_ops[0]->output_tensors[0].num_dims == 3);
+  int batch_size = input_ops[0]->output_tensors[0].dim[1];
+  int output_size = input_ops[0]->output_tensors[0].dim[2];
+  kn::KNInputOp *kn_input_op =
+      static_cast<kn::KNInputOp *>(input_ops[0]->dtensor.owner_op);
+  int output_stride = static_cast<int>(kn_input_op->input_strides[1]);
+
+  mirage::transpiler::CodeKeeper c;
+  c.inc_indent();
+  c.e("size_t event_index = "
+      "get_event_position_index(task_desc->trigger_event);");
+  c.inc_indent();
+  c.e("int target_gpu_id = "
+      "static_cast<int>(get_event_gpu_id(task_desc->trigger_event));");
+  c.e("nvshmem_reducescatter_put<bfloat16, $, $, $, $>(",
+      params[0],
+      batch_size,
+      output_size,
+      output_stride);
+  c.e("  task_desc->output_ptrs[0],");
+  c.e("  task_desc->input_ptrs[0],");
+  c.e("  &runtime_config.all_event_counters[event_index],");
+  c.e("  event_index,");
+  c.e("  target_gpu_id,");
+  c.e("  runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS]);");
+
+  return register_task_variant(TASK_NVSHMEM_REDUCESCATTER_PUT, c.to_string());
+}
+
+int TaskRegister::register_reducescatter_reduction_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_gpus
+  // params[1]: my_gpu_id
+  assert(params.size() == 2);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  // input[0]: original 3D input (world_size, batch_size, hidden_size)
+  //           — we pre-offset to input[my_gpu_id, :, :] so kernel sees 2D
+  // input[1]: receive buffer (world_size, batch_size, hidden_size)
+  // output[0]: reduced result (batch_size, hidden_size)
+  int num_inputs = 2;
+  int num_outputs = 1;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  assert(input_ops[0]->input_map.x == 1 && input_ops[0]->input_map.y == -1 &&
+         input_ops[0]->input_map.z == -1);
+  // input[0] is 3D, input[1] (buffer) is 3D, output is 2D
+  assert(input_ops[0]->output_tensors[0].num_dims == 3);
+  assert(input_ops[1]->output_tensors[0].num_dims == 3);
+  assert(output_ops[0]->output_tensors[0].num_dims == 2);
+  // batch_size and hidden from the 3D input's dims [1] and [2]
+  int batch_size = input_ops[0]->output_tensors[0].dim[1];
+  int output_size = input_ops[0]->output_tensors[0].dim[2];
+  kn::KNInputOp *kn_input_op =
+      static_cast<kn::KNInputOp *>(input_ops[0]->dtensor.owner_op);
+  int input_stride = static_cast<int>(kn_input_op->input_strides[1]);
+  kn_input_op = static_cast<kn::KNInputOp *>(output_ops[0]->dtensor.owner_op);
+  int output_stride = static_cast<int>(kn_input_op->input_strides[0]);
+  assert(input_stride == output_stride);
+
+  // Pre-offset input_ptrs[0] by my_gpu_id * batch * stride so the existing
+  // reduction_kernel sees a 2D (batch, hidden) pointer, just like allreduce.
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::reduction_kernel<bfloat16, $, $, $, $, $>(",
+         params[0],
+         params[1],
+         batch_size,
+         output_size,
+         output_stride);
+  code.e("    reinterpret_cast<void const *>("
+         "reinterpret_cast<char const *>(task_desc->input_ptrs[0]) + "
+         "$ * $ * $ * sizeof(bfloat16)),",
+         params[1], batch_size, output_stride);
+  code.e("    task_desc->input_ptrs[1],");
+  code.e("    task_desc->output_ptrs[0],");
+  code.e("    runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS]);");
+  return register_task_variant(TASK_REDUCE, code.to_string());
+}
+
+int TaskRegister::register_nvshmem_alltoall_put_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_gpus
+  // params[1]: my_gpu_id
+  assert(params.size() == 2);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  // input[0]: (world_size, batch_size, hidden_size) - 3D
+  // output[0]: (world_size, batch_size, hidden_size) - 3D
+  int num_inputs = 1;
+  int num_outputs = 1;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  assert(input_ops[0]->input_map.x == 1 && input_ops[0]->input_map.y == -1 &&
+         input_ops[0]->input_map.z == -1);
+  assert(input_ops[0]->output_tensors[0].num_dims == 3);
+  assert(output_ops[0]->output_tensors[0].num_dims == 3);
+  int batch_size = input_ops[0]->output_tensors[0].dim[1];
+  int output_size = input_ops[0]->output_tensors[0].dim[2];
+  kn::KNInputOp *kn_input_op =
+      static_cast<kn::KNInputOp *>(input_ops[0]->dtensor.owner_op);
+  int output_stride = static_cast<int>(kn_input_op->input_strides[1]);
+
+  mirage::transpiler::CodeKeeper c;
+  c.inc_indent();
+  c.e("size_t event_index = "
+      "get_event_position_index(task_desc->trigger_event);");
+  c.inc_indent();
+  c.e("int target_gpu_id = "
+      "static_cast<int>(get_event_gpu_id(task_desc->trigger_event));");
+  c.e("nvshmem_alltoall_put<bfloat16, $, $, $, $, $>(",
+      params[0],
+      params[1],
+      batch_size,
+      output_size,
+      output_stride);
+  c.e("  task_desc->output_ptrs[0],");
+  c.e("  task_desc->input_ptrs[0],");
+  c.e("  &runtime_config.all_event_counters[event_index],");
+  c.e("  event_index,");
+  c.e("  target_gpu_id,");
+  c.e("  runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS]);");
+
+  return register_task_variant(TASK_NVSHMEM_ALLTOALL_PUT, c.to_string());
+}
+
+int TaskRegister::register_nvshmem_broadcast_put_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_gpus
+  // params[1]: my_gpu_id
+  // params[2]: root_gpu_id
+  assert(params.size() == 3);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  // input[0]: (batch_size, hidden_size) on root
+  // output[0]: (batch_size, hidden_size) on all GPUs
+  int num_inputs = 1;
+  int num_outputs = 1;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  assert(input_ops[0]->input_map.x == 1 && input_ops[0]->input_map.y == -1 &&
+         input_ops[0]->input_map.z == -1);
+  assert(input_ops[0]->output_tensors[0].num_dims == 2);
+  assert(output_ops[0]->output_tensors[0].num_dims == 2);
+  int batch_size = input_ops[0]->output_tensors[0].dim[0];
+  int output_size = input_ops[0]->output_tensors[0].dim[1];
+  kn::KNInputOp *kn_input_op =
+      static_cast<kn::KNInputOp *>(input_ops[0]->dtensor.owner_op);
+  int output_stride = static_cast<int>(kn_input_op->input_strides[0]);
+
+  mirage::transpiler::CodeKeeper c;
+  c.inc_indent();
+  c.e("size_t event_index = "
+      "get_event_position_index(task_desc->trigger_event);");
+  c.inc_indent();
+  c.e("int target_gpu_id = "
+      "static_cast<int>(get_event_gpu_id(task_desc->trigger_event));");
+  c.e("nvshmem_broadcast_put<bfloat16, $, $, $>(",
+      batch_size,
+      output_size,
+      output_stride);
+  c.e("  task_desc->output_ptrs[0],");
+  c.e("  task_desc->input_ptrs[0],");
+  c.e("  &runtime_config.all_event_counters[event_index],");
+  c.e("  event_index,");
+  c.e("  target_gpu_id,");
+  c.e("  runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS]);");
+
+  return register_task_variant(TASK_NVSHMEM_BROADCAST_PUT, c.to_string());
+}
+
+int TaskRegister::register_nvshmem_broadcast_recv_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_gpus
+  // params[1]: my_gpu_id
+  // params[2]: root_gpu_id
+  assert(params.size() == 3);
+  // No-op task: data is written directly by root via NVSHMEM put.
+  // This task exists only as an event dependency node in the task graph.
+  mirage::transpiler::CodeKeeper c;
+  c.inc_indent();
+  c.e("// No-op: broadcast data received via NVSHMEM put from root GPU.");
+
+  return register_task_variant(TASK_NVSHMEM_BROADCAST_RECV, c.to_string());
+}
+
+int TaskRegister::register_nvshmem_tile_broadcast_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_gpus
+  // params[1]: my_gpu_id
+  // params[2]: root_gpu_id
+  assert(params.size() == 3);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 1;
+  int num_outputs = 1;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  assert(input_ops[0]->input_map.x == 1 && input_ops[0]->input_map.y == -1 &&
+         input_ops[0]->input_map.z == -1);
+  assert(input_ops[0]->output_tensors[0].num_dims == 2);
+  assert(output_ops[0]->output_tensors[0].num_dims == 2);
+  int batch_size = input_ops[0]->output_tensors[0].dim[0];
+  int output_size = input_ops[0]->output_tensors[0].dim[1];
+  kn::KNInputOp *kn_input_op =
+      static_cast<kn::KNInputOp *>(input_ops[0]->dtensor.owner_op);
+  int output_stride = static_cast<int>(kn_input_op->input_strides[0]);
+
+  mirage::transpiler::CodeKeeper c;
+  c.inc_indent();
+  c.e("nvshmem_tile_broadcast<__nv_bfloat16, $, $, $>(",
+      batch_size,
+      output_size,
+      output_stride);
+  c.e("  task_desc->input_ptrs[0],");
+  c.e("  task_desc->output_ptrs[0],");
+  c.e("  runtime_config.nvshmem_teams,");
+  c.e("  task_desc->task_metadata.task_offset,");
+  c.e("  runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS]);");
+  return register_task_variant(TASK_NVSHMEM_TILE_BROADCAST, c.to_string());
+}
+
 } // namespace runtime
 } // namespace mirage

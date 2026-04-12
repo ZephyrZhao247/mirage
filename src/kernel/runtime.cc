@@ -51,6 +51,18 @@ struct Dim3Comparator {
 };
 
 /**
+ * Check if a task type is an NVSHMEM put-based collective with N-1 subtasks.
+ * These tasks use nvshmemx_putmem_nbi_block + signal pattern and each
+ * (bid.x, bid.y, bid.z) has (num_gpus - 1) subtasks, one per target GPU.
+ */
+static bool is_nvshmem_put_task(TaskType task_type) {
+  return task_type == TASK_NVSHMEM_ALLGATHER_STRIDED_PUT ||
+         task_type == TASK_NVSHMEM_REDUCESCATTER_PUT ||
+         task_type == TASK_NVSHMEM_ALLTOALL_PUT ||
+         task_type == TASK_NVSHMEM_BROADCAST_PUT;
+}
+
+/**
  * Get number of subtasks for a task type.
  *
  * For each (bid.x, bid.y, bid.z), there could be multiple subtasks associated
@@ -58,14 +70,14 @@ struct Dim3Comparator {
  * normal tasks. The biggest difference is that these subtasks share the same
  * input/output tensors.
  *
- * For example, for NVSHMEM_ALLGATHER_STRIDED_PUT task, each (bid.x, bid.y,
- * bid.z) will have (num_gpus - 1) subtasks, each subtask is responsible for
- * putting data to one of the other GPUs.
+ * For NVSHMEM put-based tasks, each (bid.x, bid.y, bid.z) will have
+ * (num_gpus - 1) subtasks, each subtask is responsible for putting data to
+ * one of the other GPUs.
  */
 int get_num_subtasks(int num_gpus, TaskType task_type) {
   // TODO(Zepeng) Re-consider this design. Try if task coalescing can result in
   // better performance.
-  if (task_type == TASK_NVSHMEM_ALLGATHER_STRIDED_PUT) {
+  if (is_nvshmem_put_task(task_type)) {
     return num_gpus - 1;
   } else {
     return 1;
@@ -125,16 +137,14 @@ void dfs_create_events_add_tasks(
         for (bid.z = producer_lo_bid.z; bid.z < producer_hi_bid.z; bid.z++) {
           assert(pre_task_map.find(bid) != pre_task_map.end());
           std::vector<TaskId> const &task_ids = pre_task_map.find(bid)->second;
-          if (all_tasks[task_ids[0]].task_type ==
-              TASK_NVSHMEM_ALLGATHER_STRIDED_PUT) {
+          if (is_nvshmem_put_task(all_tasks[task_ids[0]].task_type)) {
             assert(task_ids.size() == (size_t)num_gpus - 1);
             for (int tgt_gpu_id = 0; tgt_gpu_id < num_gpus; tgt_gpu_id++) {
               if (tgt_gpu_id == my_gpu_id) {
                 continue;
               }
               size_t idx = tgt_gpu_id < my_gpu_id ? tgt_gpu_id : tgt_gpu_id - 1;
-              assert(all_tasks[task_ids[idx]].task_type ==
-                     TASK_NVSHMEM_ALLGATHER_STRIDED_PUT);
+              assert(is_nvshmem_put_task(all_tasks[task_ids[idx]].task_type));
               all_tasks[task_ids[idx]].trigger_event =
                   get_event_id(tgt_gpu_id,
                                all_events.size(),
@@ -362,7 +372,7 @@ void register_mugraph(
     };
 
     int cur_op_num_subtasks = get_num_subtasks(num_gpus, task_type);
-    bool cur_op_is_multigpu = (task_type == TASK_NVSHMEM_ALLGATHER_STRIDED_PUT);
+    bool cur_op_is_multigpu = is_nvshmem_put_task(task_type);
 
     std::vector<FullTaskDesc> tasks;
     // Step 1: add all tasks based on their blockIdx
@@ -1112,8 +1122,11 @@ TaskGraphResult print_task_graph(
 
             for (int i = 0; i < task_desc.num_outputs; i++) {
               off_t offset = 0;
-              if (task_type == runtime::TASK_NVSHMEM_ALLGATHER_STRIDED_PUT) {
-                // A special case for buffer-style tensors.
+              if (task_type == runtime::TASK_NVSHMEM_ALLGATHER_STRIDED_PUT ||
+                  task_type == runtime::TASK_NVSHMEM_REDUCESCATTER_PUT ||
+                  task_type == runtime::TASK_NVSHMEM_ALLTOALL_PUT) {
+                // A special case for buffer-style tensors where each GPU writes
+                // to its own slot (indexed by my_gpu_id) in the output buffer.
                 offset = my_gpu_id * input_ops[0]->dtensor.num_elements();
               }
               int3 output_map = output_ops[i]->input_map;
@@ -1293,6 +1306,18 @@ TaskGraphResult print_task_graph(
       "TASK_NVSHMEM_ALLGATHER_STRIDED_PUT";
   task_type_to_name[TASK_NVSHMEM_TILE_ALLREDUCE] =
       "TASK_NVSHMEM_TILE_ALLREDUCE";
+  task_type_to_name[TASK_NVSHMEM_TILE_ALLGATHER] =
+      "TASK_NVSHMEM_TILE_ALLGATHER";
+  task_type_to_name[TASK_NVSHMEM_REDUCESCATTER_PUT] =
+      "TASK_NVSHMEM_REDUCESCATTER_PUT";
+  task_type_to_name[TASK_NVSHMEM_ALLTOALL_PUT] =
+      "TASK_NVSHMEM_ALLTOALL_PUT";
+  task_type_to_name[TASK_NVSHMEM_BROADCAST_PUT] =
+      "TASK_NVSHMEM_BROADCAST_PUT";
+  task_type_to_name[TASK_NVSHMEM_BROADCAST_RECV] =
+      "TASK_NVSHMEM_BROADCAST_RECV";
+  task_type_to_name[TASK_NVSHMEM_TILE_BROADCAST] =
+      "TASK_NVSHMEM_TILE_BROADCAST";
 
   code.e("__device__ __forceinline__");
   code.e("void _execute_task(TaskDesc const* task_desc,");

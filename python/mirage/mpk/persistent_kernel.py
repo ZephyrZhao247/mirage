@@ -13,7 +13,11 @@ from .speculative import (
     PromptLookupConfig,
 )
 from .multigpu import (
-  auto_select_allreduce_implementation
+  auto_select_allreduce_implementation,
+  auto_select_allgather_implementation,
+  auto_select_reduce_scatter_implementation,
+  auto_select_broadcast_implementation,
+  auto_select_alltoall_implementation,
 )
 from typing import Optional
 
@@ -1351,9 +1355,84 @@ class PersistentKernel:
             "output": output,
         }
         params = [self.world_size, self.mpi_rank]
-        best_implementation.register_tasks(self, tensors=tensors, grid_dim=grid_dim, 
+        best_implementation.register_tasks(self, tensors=tensors, grid_dim=grid_dim,
                                            block_dim=block_dim, params=params)
 
+    def allgather_layer(
+        self,
+        input: DTensor,
+        output: DTensor,
+        grid_dim: tuple,
+        block_dim: tuple,
+    ):
+        assert input.num_dims == 2   # (batch_size, hidden_size)
+        assert output.num_dims == 3  # (world_size, batch_size, hidden_size)
+        best_implementation = auto_select_allgather_implementation(self.world_size, self.mpi_rank)
+        tensors = {
+            "input": input,
+            "output": output,
+        }
+        params = [self.world_size, self.mpi_rank]
+        best_implementation.register_tasks(self, tensors=tensors, grid_dim=grid_dim,
+                                           block_dim=block_dim, params=params)
+
+    def reduce_scatter_layer(
+        self,
+        input: DTensor,
+        buffer: DTensor,
+        output: DTensor,
+        grid_dim: tuple,
+        block_dim: tuple,
+    ):
+        assert input.num_dims == 3   # (world_size, batch_size, hidden_size)
+        assert buffer.num_dims == 3  # (world_size, batch_size, hidden_size)
+        assert output.num_dims == 2  # (batch_size, hidden_size)
+        best_implementation = auto_select_reduce_scatter_implementation(self.world_size, self.mpi_rank)
+        tensors = {
+            "input": input,
+            "buffer": buffer,
+            "output": output,
+        }
+        params = [self.world_size, self.mpi_rank]
+        best_implementation.register_tasks(self, tensors=tensors, grid_dim=grid_dim,
+                                           block_dim=block_dim, params=params)
+
+    def broadcast_layer(
+        self,
+        input: DTensor,
+        output: DTensor,
+        root_gpu_id: int,
+        grid_dim: tuple,
+        block_dim: tuple,
+    ):
+        assert input.num_dims == 2   # (batch_size, hidden_size)
+        assert output.num_dims == 2  # (batch_size, hidden_size)
+        best_implementation = auto_select_broadcast_implementation(self.world_size, self.mpi_rank)
+        tensors = {
+            "input": input,
+            "output": output,
+        }
+        params = [self.world_size, self.mpi_rank, root_gpu_id]
+        best_implementation.register_tasks(self, tensors=tensors, grid_dim=grid_dim,
+                                           block_dim=block_dim, params=params)
+
+    def alltoall_layer(
+        self,
+        input: DTensor,
+        output: DTensor,
+        grid_dim: tuple,
+        block_dim: tuple,
+    ):
+        assert input.num_dims == 3   # (world_size, batch_size, hidden_size)
+        assert output.num_dims == 3  # (world_size, batch_size, hidden_size)
+        best_implementation = auto_select_alltoall_implementation(self.world_size, self.mpi_rank)
+        tensors = {
+            "input": input,
+            "output": output,
+        }
+        params = [self.world_size, self.mpi_rank]
+        best_implementation.register_tasks(self, tensors=tensors, grid_dim=grid_dim,
+                                           block_dim=block_dim, params=params)
 
     def silu_mul_layer(
         self,

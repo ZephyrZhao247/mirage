@@ -712,6 +712,42 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(1, 1, TASK_NVSHMEM_TILE_ALLREDUCE, variant_id);
+  } else if (name == "nvshmem_tile_allgather") {
+    int variant_id = task_register->register_nvshmem_tile_allgather_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(1, 1, TASK_NVSHMEM_TILE_ALLGATHER, variant_id);
+  } else if (name == "reducescatter_reduction") {
+    int variant_id = task_register->register_reducescatter_reduction_task(
+        customized->bgraph, params);
+    task_config[op] = std::make_tuple(2, 1, TASK_REDUCE, variant_id);
+  } else if (name == "nvshmem_reducescatter_put") {
+    int variant_id = task_register->register_nvshmem_reducescatter_put_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(1, 1, TASK_NVSHMEM_REDUCESCATTER_PUT, variant_id);
+  } else if (name == "nvshmem_alltoall_put") {
+    int variant_id = task_register->register_nvshmem_alltoall_put_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(1, 1, TASK_NVSHMEM_ALLTOALL_PUT, variant_id);
+  } else if (name == "nvshmem_broadcast_put") {
+    int variant_id = task_register->register_nvshmem_broadcast_put_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(1, 1, TASK_NVSHMEM_BROADCAST_PUT, variant_id);
+  } else if (name == "nvshmem_broadcast_recv") {
+    int variant_id = task_register->register_nvshmem_broadcast_recv_task(
+        customized->bgraph, params);
+    // broadcast_recv has 1 input (output tensor written by root) and 0 outputs
+    // but we register it as 1 input, 1 output to match the Python layer
+    task_config[op] =
+        std::make_tuple(1, 1, TASK_NVSHMEM_BROADCAST_RECV, variant_id);
+  } else if (name == "nvshmem_tile_broadcast") {
+    int variant_id = task_register->register_nvshmem_tile_broadcast_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(1, 1, TASK_NVSHMEM_TILE_BROADCAST, variant_id);
   }
 
   else {

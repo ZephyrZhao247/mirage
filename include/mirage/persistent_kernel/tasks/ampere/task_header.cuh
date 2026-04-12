@@ -15,6 +15,9 @@
 
 #ifdef USE_NVSHMEM
 #include "allreduce.cuh"
+#include "reduce_scatter.cuh"
+#include "alltoall.cuh"
+#include "broadcast.cuh"
 #endif
 
 #if MIRAGE_USE_CUTLASS_KERNEL

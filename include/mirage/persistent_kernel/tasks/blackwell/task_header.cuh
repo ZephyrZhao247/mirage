@@ -5,6 +5,9 @@
 #include "tasks/ampere/silu_mul.cuh"
 #ifdef USE_NVSHMEM
 #include "tasks/ampere/allreduce.cuh"
+#include "tasks/ampere/reduce_scatter.cuh"
+#include "tasks/ampere/alltoall.cuh"
+#include "tasks/ampere/broadcast.cuh"
 #endif // USE_NVSHMEM
 // Hopper task impls
 #include "tasks/cute/hopper/gemm_ws.cuh"
@@ -18,6 +21,8 @@
 #include "tasks/hopper/silu_mul_hopper.cuh"
 #ifdef USE_NVSHMEM
 #include "tasks/hopper/allreduce.cuh"
+#include "tasks/hopper/allgather.cuh"
+#include "tasks/hopper/broadcast.cuh"
 #endif // USE_NVSHMEM
 // Blackwell task impls
 #include "argmax_sm100.cuh"

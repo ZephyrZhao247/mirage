@@ -211,10 +211,164 @@ class AllReduceStrategy_NvshmemTile(AllReduceStrategy):
 # Concrete AllGather Implementations
 # ============================================================================
 
+class AllGatherStrategy_StridedPut(AllGatherStrategy):
+    """AllGather using NVSHMEM strided put operations."""
+
+    def __init__(self):
+        super().__init__("nvshmem_allgather_strided_put")
+
+    def register_tasks(self, mpk, tensors: Dict, grid_dim: Tuple,
+                      block_dim: Tuple, params: List[int]) -> None:
+        assert len(params) == 2, "params should contain [world_size, rank]"
+        input_tensor = tensors.pop("input")
+        output_tensor = tensors.pop("output")
+
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input_tensor, (1, -1, -1), -1, True)
+        tb_graph.new_input(output_tensor, (2, -1, -1), -1, True)
+        mpk.kn_graph.customized([input_tensor, output_tensor], tb_graph)
+        mpk.kn_graph.register_task(tb_graph, "nvshmem_allgather_strided_put", params)
+
+
+class AllGatherStrategy_NvshmemTile(AllGatherStrategy):
+    """AllGather using NVSHMEM tile-based operations (for SM >= 90)."""
+
+    def __init__(self):
+        super().__init__("nvshmem_tile_allgather")
+
+    def register_tasks(self, mpk, tensors: Dict, grid_dim: Tuple,
+                      block_dim: Tuple, params: List[int]) -> None:
+        assert len(params) == 2, "params should contain [world_size, rank]"
+        input_tensor = tensors.pop("input")
+        output_tensor = tensors.pop("output")
+
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input_tensor, (1, -1, -1), -1, True)
+        tb_graph.new_input(output_tensor, (1, -1, -1), -1, True)
+        mpk.kn_graph.customized([input_tensor, output_tensor], tb_graph)
+        mpk.kn_graph.register_task(tb_graph, "nvshmem_tile_allgather", params)
+
+        allocate_nvshmem_teams(mpk, grid_dim[0] * grid_dim[1] * grid_dim[2])
+
+
+# ============================================================================
+# Concrete ReduceScatter Implementations
+# ============================================================================
+
+class ReduceScatterStrategy_PutReduce(ReduceScatterStrategy):
+    """ReduceScatter using NVSHMEM scatter-put + local reduction."""
+
+    def __init__(self):
+        super().__init__("scatter_put + reduce")
+
+    def register_tasks(self, mpk, tensors: Dict, grid_dim: Tuple,
+                      block_dim: Tuple, params: List[int]) -> None:
+        assert len(params) == 2, "params should contain [world_size, rank]"
+        input_tensor = tensors.pop("input")
+        output_tensor = tensors.pop("output")
+        buffer_tensor = tensors.pop("buffer")
+
+        # Phase 1: scatter-put — GPU i sends input[j] to buffer[i] on GPU j
+        scatter_tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        scatter_tb_graph.new_input(input_tensor, (1, -1, -1), -1, True)
+        scatter_tb_graph.new_input(buffer_tensor, (2, -1, -1), -1, True)
+        mpk.kn_graph.customized([input_tensor, buffer_tensor], scatter_tb_graph)
+        mpk.kn_graph.register_task(scatter_tb_graph, "nvshmem_reducescatter_put", params)
+
+        # Phase 2: local reduction — sum buffer[0..N-1] + input[my_id] → output
+        # Uses reducescatter_reduction which pre-offsets the 3D input pointer
+        # by my_gpu_id so reduction_kernel sees a 2D (batch, hidden) pointer.
+        reduction_tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        reduction_tb_graph.new_input(input_tensor, (1, -1, -1), -1, True)
+        reduction_tb_graph.new_input(buffer_tensor, (2, -1, -1), -1, True)
+        reduction_tb_graph.new_input(output_tensor, (1, -1, -1), -1, True)
+        mpk.kn_graph.customized([input_tensor, buffer_tensor, output_tensor], reduction_tb_graph)
+        mpk.kn_graph.register_task(reduction_tb_graph, "reducescatter_reduction", params)
+
+
+# ============================================================================
+# Concrete Broadcast Implementations
+# ============================================================================
+
+class BroadcastStrategy_Put(BroadcastStrategy):
+    """Broadcast using NVSHMEM put operations from root."""
+
+    def __init__(self):
+        super().__init__("nvshmem_broadcast_put")
+
+    def register_tasks(self, mpk, tensors: Dict, grid_dim: Tuple,
+                      block_dim: Tuple, params: List[int]) -> None:
+        assert len(params) == 3, "params should contain [world_size, rank, root_gpu_id]"
+        input_tensor = tensors.pop("input")
+        output_tensor = tensors.pop("output")
+        my_gpu_id = params[1]
+        root_gpu_id = params[2]
+
+        if my_gpu_id == root_gpu_id:
+            # Root: register broadcast put task (N-1 subtasks)
+            tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+            tb_graph.new_input(input_tensor, (1, -1, -1), -1, True)
+            tb_graph.new_input(output_tensor, (1, -1, -1), -1, True)
+            mpk.kn_graph.customized([input_tensor, output_tensor], tb_graph)
+            mpk.kn_graph.register_task(tb_graph, "nvshmem_broadcast_put", params)
+        else:
+            # Non-root: register no-op receive task
+            tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+            tb_graph.new_input(input_tensor, (1, -1, -1), -1, True)
+            tb_graph.new_input(output_tensor, (1, -1, -1), -1, True)
+            mpk.kn_graph.customized([input_tensor, output_tensor], tb_graph)
+            mpk.kn_graph.register_task(tb_graph, "nvshmem_broadcast_recv", params)
+
+
+class BroadcastStrategy_NvshmemTile(BroadcastStrategy):
+    """Broadcast using NVSHMEM tile-based operations (for SM >= 90)."""
+
+    def __init__(self):
+        super().__init__("nvshmem_tile_broadcast")
+
+    def register_tasks(self, mpk, tensors: Dict, grid_dim: Tuple,
+                      block_dim: Tuple, params: List[int]) -> None:
+        assert len(params) == 3, "params should contain [world_size, rank, root_gpu_id]"
+        input_tensor = tensors.pop("input")
+        output_tensor = tensors.pop("output")
+
+        # Tile broadcast is symmetric: all PEs call the same function.
+        # The calling PE broadcasts its src to all dst tensors in the team.
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input_tensor, (1, -1, -1), -1, True)
+        tb_graph.new_input(output_tensor, (1, -1, -1), -1, True)
+        mpk.kn_graph.customized([input_tensor, output_tensor], tb_graph)
+        mpk.kn_graph.register_task(tb_graph, "nvshmem_tile_broadcast", params)
+
+        allocate_nvshmem_teams(mpk, grid_dim[0] * grid_dim[1] * grid_dim[2])
+
 
 # ============================================================================
 # Concrete AllToAll Implementations
 # ============================================================================
+
+class AllToAllStrategy_Put(AllToAllStrategy):
+    """AllToAll using NVSHMEM put operations."""
+
+    def __init__(self):
+        super().__init__("nvshmem_alltoall_put")
+
+    def register_tasks(self, mpk, tensors: Dict, grid_dim: Tuple,
+                      block_dim: Tuple, params: List[int]) -> None:
+        assert len(params) == 2, "params should contain [world_size, rank]"
+        input_tensor = tensors.pop("input")
+        output_tensor = tensors.pop("output")
+
+        # Phase 1: cross-GPU put — GPU i sends input[j] to output[i] on GPU j
+        put_tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        put_tb_graph.new_input(input_tensor, (1, -1, -1), -1, True)
+        put_tb_graph.new_input(output_tensor, (2, -1, -1), -1, True)
+        mpk.kn_graph.customized([input_tensor, output_tensor], put_tb_graph)
+        mpk.kn_graph.register_task(put_tb_graph, "nvshmem_alltoall_put", params)
+
+        # Phase 2: local copy — input[my_id] -> output[my_id]
+        # Use identity_layer for the local chunk copy
+        # This is handled by the caller in the Python layer method.
 
 
 # ============================================================================
@@ -251,48 +405,37 @@ def auto_select_allgather_implementation(
     num_gpus: int,
     device_id: int = 0,
 ) -> AllGatherStrategy:
-    """
-    Automatically select the best AllGather implementation.
-    
-    Args:
-        num_gpus: Number of GPUs involved in the collective
-        device_id: GPU device ID to query capabilities
-        
-    Returns:
-        An AllGatherStrategy instance ready to register tasks
-    """
-    raise NotImplementedError("AllGather strategies are not yet implemented.")
-
-
-def auto_select_broadcast_implementation(
-    num_gpus: int,
-    device_id: int = 0,
-) -> BroadcastStrategy:
-    """
-    Automatically select the best Broadcast implementation.
-    
-    Args:
-        num_gpus: Number of GPUs involved in the collective
-        device_id: GPU device ID to query capabilities
-        
-    Returns:
-        A BroadcastStrategy instance ready to register tasks
-    """
-    raise NotImplementedError("Broadcast strategies are not yet implemented.")
+    capabilities = get_collective_capabilities(num_gpus, device_id)
+    if capabilities.target_cc >= 90:
+        if (capabilities.vmm_supported and capabilities.multicast_supported
+            and capabilities.peer_access_supported):
+            return AllGatherStrategy_NvshmemTile()
+    return AllGatherStrategy_StridedPut()
 
 
 def auto_select_reduce_scatter_implementation(
     num_gpus: int,
     device_id: int = 0,
 ) -> ReduceScatterStrategy:
-    """
-    Automatically select the best ReduceScatter implementation.
-    
-    Args:
-        num_gpus: Number of GPUs involved in the collective
-        device_id: GPU device ID to query capabilities
-        
-    Returns:
-        A ReduceScatterStrategy instance ready to register tasks
-    """
-    raise NotImplementedError("ReduceScatter strategies are not yet implemented.")
+    # No tile API for reduce-scatter; put-based only on all architectures.
+    return ReduceScatterStrategy_PutReduce()
+
+
+def auto_select_broadcast_implementation(
+    num_gpus: int,
+    device_id: int = 0,
+) -> BroadcastStrategy:
+    capabilities = get_collective_capabilities(num_gpus, device_id)
+    if capabilities.target_cc >= 90:
+        if (capabilities.vmm_supported and capabilities.multicast_supported
+            and capabilities.peer_access_supported):
+            return BroadcastStrategy_NvshmemTile()
+    return BroadcastStrategy_Put()
+
+
+def auto_select_alltoall_implementation(
+    num_gpus: int,
+    device_id: int = 0,
+) -> AllToAllStrategy:
+    # No tile API for alltoall; put-based only on all architectures.
+    return AllToAllStrategy_Put()
