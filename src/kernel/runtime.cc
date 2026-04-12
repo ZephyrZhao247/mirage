@@ -72,7 +72,9 @@ int get_num_subtasks(int num_gpus, TaskType task_type) {
   }
 }
 
-void dfs_create_events_add_tasks(
+// Refactored DFS: creates edge events and records bid-to-event mappings.
+// Does NOT modify task descriptors or add tasks to all_tasks.
+void dfs_create_edge_events(
     int depth,
     int const my_gpu_id,
     int const num_gpus,
@@ -86,80 +88,55 @@ void dfs_create_events_add_tasks(
     dim3 producer_lo_bid,
     dim3 producer_hi_bid,
     std::vector<EventDesc> &all_events,
-    std::vector<FullTaskDesc> &all_tasks,
-    std::vector<FullTaskDesc> const &cur_op_tasks,
-    std::map<dim3, std::vector<TaskId>, Dim3Comparator> const &pre_task_map,
-    std::map<dim3, std::vector<TaskId>, Dim3Comparator> &cur_task_map,
+    // Output: bid → event index mappings
+    std::map<dim3, size_t, Dim3Comparator> &producer_bid_to_event,
+    std::map<dim3, size_t, Dim3Comparator> &consumer_bid_to_event,
     std::unordered_set<size_t> &nvshmem_events_idx,
     bool nvshmem_event,
-    bool multigpu_task) {
+    // Producer task info (for computing num_triggers)
+    std::map<dim3, std::vector<TaskId>, Dim3Comparator> const &producer_task_map,
+    std::vector<FullTaskDesc> const &all_tasks) {
   if (depth >= mirage::config::MAX_TENSOR_DIMS) {
-    EventDesc event_desc;
-    event_desc.num_triggers = 0;
-    event_desc.first_task_id = all_tasks.size();
-    // Add consumer tasks
+    // Base case: create one event for this partition
+    size_t event_index = all_events.size();
+
+    // Count num_triggers from producer tasks in this partition
+    int num_triggers = 0;
     dim3 bid;
-    for (bid.x = consumer_lo_bid.x; bid.x < consumer_hi_bid.x; bid.x++) {
-      for (bid.y = consumer_lo_bid.y; bid.y < consumer_hi_bid.y; bid.y++) {
-        for (bid.z = consumer_lo_bid.z; bid.z < consumer_hi_bid.z; bid.z++) {
-          int block_offset = bid.x * consumer_grid_dim.y * consumer_grid_dim.z +
-                             bid.y * consumer_grid_dim.z + bid.z;
-          if (multigpu_task) {
-            cur_task_map[bid] = std::vector<TaskId>();
-            for (int i = 0; i < num_gpus - 1; i++) {
-              cur_task_map[bid].push_back(all_tasks.size());
-              all_tasks.push_back(
-                  cur_op_tasks[block_offset * (num_gpus - 1) + i]);
-            }
-          } else {
-            cur_task_map[bid] = std::vector<TaskId>{all_tasks.size()};
-            all_tasks.push_back(cur_op_tasks[block_offset]);
-          }
-        }
-      }
-    }
-    event_desc.last_task_id = all_tasks.size();
-    // Set producer tasks
     for (bid.x = producer_lo_bid.x; bid.x < producer_hi_bid.x; bid.x++) {
       for (bid.y = producer_lo_bid.y; bid.y < producer_hi_bid.y; bid.y++) {
         for (bid.z = producer_lo_bid.z; bid.z < producer_hi_bid.z; bid.z++) {
-          assert(pre_task_map.find(bid) != pre_task_map.end());
-          std::vector<TaskId> const &task_ids = pre_task_map.find(bid)->second;
+          assert(producer_task_map.find(bid) != producer_task_map.end());
+          auto const &task_ids = producer_task_map.find(bid)->second;
           if (all_tasks[task_ids[0]].task_type ==
               TASK_NVSHMEM_ALLGATHER_STRIDED_PUT) {
-            assert(task_ids.size() == (size_t)num_gpus - 1);
-            for (int tgt_gpu_id = 0; tgt_gpu_id < num_gpus; tgt_gpu_id++) {
-              if (tgt_gpu_id == my_gpu_id) {
-                continue;
-              }
-              size_t idx = tgt_gpu_id < my_gpu_id ? tgt_gpu_id : tgt_gpu_id - 1;
-              assert(all_tasks[task_ids[idx]].task_type ==
-                     TASK_NVSHMEM_ALLGATHER_STRIDED_PUT);
-              all_tasks[task_ids[idx]].trigger_event =
-                  get_event_id(tgt_gpu_id,
-                               all_events.size(),
-                               nvshmem_event /*nvshmem_event*/);
-              event_desc.num_triggers++;
-            }
+            num_triggers += (num_gpus - 1);
           } else {
-            assert(task_ids.size() == 1);
-            all_tasks[task_ids[0]].trigger_event = get_event_id(
-                my_gpu_id, all_events.size(), nvshmem_event /*nvshmem_event*/);
-            event_desc.num_triggers++;
+            num_triggers += 1;
           }
+          producer_bid_to_event[bid] = event_index;
         }
       }
     }
-    if (nvshmem_event) {
-      // NVSHMEM events need to be triggered by all other GPUs
-      nvshmem_events_idx.insert(all_events.size());
+
+    // Record consumer bid → event mapping
+    for (bid.x = consumer_lo_bid.x; bid.x < consumer_hi_bid.x; bid.x++) {
+      for (bid.y = consumer_lo_bid.y; bid.y < consumer_hi_bid.y; bid.y++) {
+        for (bid.z = consumer_lo_bid.z; bid.z < consumer_hi_bid.z; bid.z++) {
+          consumer_bid_to_event[bid] = event_index;
+        }
+      }
     }
-    event_desc.event_type =
-        event_desc.last_task_id >= event_desc.first_task_id + 8
-            ? EVENT_LAUNCH_MASSIVE_TASKS
-            : EVENT_LAUNCH_TASKS;
+
+    if (nvshmem_event) {
+      nvshmem_events_idx.insert(event_index);
+    }
+
+    // Create event as EVENT_EMPTY (barrier-only, polled via dependent_event)
+    EventDesc event_desc(EVENT_EMPTY, num_triggers, 0, 0);
     all_events.push_back(event_desc);
   } else {
+    // Recursive case: partition along tensor dimensions
     for (int i = 0; i < event_dims[depth]; i++) {
       dim3 new_consumer_lo_bid = consumer_lo_bid;
       dim3 new_consumer_hi_bid = consumer_hi_bid;
@@ -195,27 +172,85 @@ void dfs_create_events_add_tasks(
         new_producer_lo_bid.z = i * factor;
         new_producer_hi_bid.z = (i + 1) * factor;
       }
-      dfs_create_events_add_tasks(depth + 1,
-                                  my_gpu_id,
-                                  num_gpus,
-                                  event_dims,
-                                  input_map,
-                                  output_map,
-                                  consumer_grid_dim,
-                                  producer_grid_dim,
-                                  new_consumer_lo_bid,
-                                  new_consumer_hi_bid,
-                                  new_producer_lo_bid,
-                                  new_producer_hi_bid,
-                                  all_events,
-                                  all_tasks,
-                                  cur_op_tasks,
-                                  pre_task_map,
-                                  cur_task_map,
-                                  nvshmem_events_idx,
-                                  nvshmem_event,
-                                  multigpu_task);
+      dfs_create_edge_events(depth + 1, my_gpu_id, num_gpus,
+                             event_dims, input_map, output_map,
+                             consumer_grid_dim, producer_grid_dim,
+                             new_consumer_lo_bid, new_consumer_hi_bid,
+                             new_producer_lo_bid, new_producer_hi_bid,
+                             all_events,
+                             producer_bid_to_event, consumer_bid_to_event,
+                             nvshmem_events_idx, nvshmem_event,
+                             producer_task_map, all_tasks);
     }
+  }
+}
+
+// Helper: extract TensorDesc from a TBInputOp
+static TensorDesc get_tensor_desc(tb::TBInputOp *const &tb_op) {
+  TensorDesc desc;
+  assert(tb_op->output_tensors.size() == 1);
+  tb::STensor stensor = tb_op->output_tensors[0];
+  kn::KNInputOp *kernel_input_op =
+      static_cast<kn::KNInputOp *>(tb_op->dtensor.owner_op);
+  desc.num_dims = stensor.num_dims;
+  desc.data_type = stensor.data_type;
+  for (int d = stensor.num_dims - 1; d >= 0; d--) {
+    desc.dim[d] = stensor.dim[d];
+    desc.stride[d] = kernel_input_op->input_strides[d];
+  }
+  return desc;
+}
+
+// Helper: set task metadata based on task type and block index
+static void set_task_metadata(FullTaskDesc &task, TaskType task_type,
+                              dim3 bid, dim3 grid_dim) {
+  if ((task_type == TASK_ATTENTION_1) || (task_type == TASK_ATTENTION_2) ||
+      (task_type == TASK_SINGLE_BATCH_EXTEND_ATTENTION) ||
+      (task_type == TASK_PAGED_ATTENTION_1) ||
+      (task_type == TASK_PAGED_ATTENTION_2) ||
+      (task_type == TASK_PAGED_ATTENTION_HOPPER) ||
+      (task_type == TASK_PAGED_ATTENTION_SPLIT_KV_SM100) ||
+      (TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_SM100) ||
+      (task_type == TASK_PAGED_ATTENTION_SPLIT_KV_HOPPER) ||
+      (task_type == TASK_ATTN_SM100)) {
+    task.task_metadata.request_id = bid.x;
+  }
+  if (task_type == TASK_MOE_W13_LINEAR_SM100 ||
+      task_type == TASK_MOE_W2_LINEAR_SM100 ||
+      task_type == TASK_MOE_W13_LINEAR_SM90 ||
+      task_type == TASK_MOE_W2_LINEAR_SM90 ||
+      task_type == TASK_MOE_W13_FP8_SM100 ||
+      task_type == TASK_MOE_W2_FP8_SM100) {
+    task.task_metadata.expert_offset = bid.x;
+  }
+  if (task_type == TASK_PAGED_ATTENTION_SPLIT_KV_SM100 ||
+      task_type == TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_SM100 ||
+      task_type == TASK_PAGED_ATTENTION_SPLIT_KV_HOPPER) {
+    task.task_metadata.kv_idx = bid.z;
+    task.task_metadata.merge_task_offset = bid.y;
+  }
+  if (task_type == TASK_MLA_DECODE_SM100) {
+    task.task_metadata.request_id = bid.y;
+    task.task_metadata.kv_idx = bid.x;
+  }
+  if (task_type == TASK_MLA_REDUCE_SM100) {
+    task.task_metadata.request_id = bid.x;
+  }
+  if (task_type == TASK_MLA_PREFILL_SM100) {
+    task.task_metadata.request_id = bid.x;
+    task.task_metadata.kv_idx = bid.y;
+  }
+  if (task_type == TASK_MLA_MTP_DECODE_SM100) {
+    task.task_metadata.kv_idx = bid.x;
+    task.task_metadata.request_id = bid.y;
+  }
+  if (task_type == TASK_MLA_MTP_REDUCE_SM100) {
+    task.task_metadata.kv_idx = bid.x;
+    task.task_metadata.request_id = bid.y;
+  }
+  if (task_type == TASK_NVSHMEM_TILE_ALLREDUCE) {
+    task.task_metadata.task_offset =
+        bid.x + bid.y * grid_dim.x + bid.z * grid_dim.x * grid_dim.y;
   }
 }
 
@@ -231,339 +266,429 @@ void register_mugraph(
         &all_task_maps,
     std::unordered_map<kn::KNOperator const *,
                        std::tuple<int, int, TaskType, int>> const
-        &task_configs) {
-  // push a begin-graph task and a event to launch dependent asks
+        &task_configs,
+    std::vector<EventId> &all_trigger_events_vec,
+    std::vector<EventId> &all_dependent_events_vec) {
+
+  std::unordered_set<size_t> nvshmem_events_idx;
+
+  // === Setup: TASK_BEGIN_TASK_GRAPH and EVENT_LAUNCH_DEPENDENT_TASKS ===
   {
+    size_t begin_event_idx = all_events.size();
     EventDesc e(EVENT_LAUNCH_DEPENDENT_TASKS, 1, 0, 0);
     FullTaskDesc t(TASK_BEGIN_TASK_GRAPH, 0 /*variant_id*/);
-    t.trigger_event = get_event_id(my_gpu_id, all_events.size(), false);
+    t.trigger_events_start = all_trigger_events_vec.size();
+    t.trigger_events_count = 1;
+    all_trigger_events_vec.push_back(
+        get_event_id(my_gpu_id, begin_event_idx, false));
     all_tasks.push_back(t);
     all_events.push_back(e);
   }
-  std::vector<tb::TBInputOp *> pre_output_ops;
-  kn::KNCustomizedOp const *pre_op = nullptr;
-  std::map<dim3, std::vector<TaskId>, Dim3Comparator> pre_task_map;
-  std::unordered_set<size_t> nvshmem_events_idx;
-  bool prev_op_is_multigpu = false;
+
+  // === Phase 1: Create tasks for all operators (topological order) ===
+  struct OpInfo {
+    kn::KNCustomizedOp const *op;
+    kernel::KNOperator *raw_op; // non-const for all_task_maps key
+    std::map<dim3, std::vector<TaskId>, Dim3Comparator> task_map;
+    std::vector<tb::TBInputOp *> input_ops;
+    std::vector<tb::TBInputOp *> output_ops;
+    int num_inputs, num_outputs;
+    TaskType task_type;
+    int variant_id;
+    bool is_multigpu;
+  };
+  std::vector<OpInfo> op_infos;
+  std::map<kn::KNOperator const *, size_t> op_to_index;
+
   for (auto const &op : graph.operators) {
     if (op->op_type == type::KNOperatorType::KN_INPUT_OP) {
       continue;
     }
-    std::tuple<int, int, TaskType, int> task_config =
-        task_configs.find(op)->second;
     assert(op->op_type == type::KNOperatorType::KN_CUSTOMIZED_OP);
-    // Customized op
-    kn::KNCustomizedOp const *cur_op =
-        dynamic_cast<kn::KNCustomizedOp const *>(op);
-    tb::Graph const &bgraph = cur_op->bgraph;
-    dim3 bid;
-    std::vector<tb::TBInputOp *> input_ops;
-    std::vector<tb::TBInputOp *> output_ops;
-    int num_inputs = std::get<0>(task_config);
-    int num_outputs = std::get<1>(task_config);
-    TaskType task_type = std::get<2>(task_config);
-    int variant_id = std::get<3>(task_config);
-    assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
-    for (auto const &op : bgraph.operators) {
-      assert(op->op_type == mirage::type::TB_INPUT_OP);
-      if (input_ops.size() < (size_t)num_inputs) {
-        input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    auto task_config_it = task_configs.find(op);
+    assert(task_config_it != task_configs.end());
+    auto task_config = task_config_it->second;
+
+    OpInfo info;
+    info.op = dynamic_cast<kn::KNCustomizedOp const *>(op);
+    info.raw_op = op;
+    info.num_inputs = std::get<0>(task_config);
+    info.num_outputs = std::get<1>(task_config);
+    info.task_type = std::get<2>(task_config);
+    info.variant_id = std::get<3>(task_config);
+    info.is_multigpu =
+        (info.task_type == TASK_NVSHMEM_ALLGATHER_STRIDED_PUT);
+
+    tb::Graph const &bgraph = info.op->bgraph;
+    assert(bgraph.operators.size() ==
+           (size_t)info.num_inputs + info.num_outputs);
+    for (auto const &tb_op : bgraph.operators) {
+      assert(tb_op->op_type == mirage::type::TB_INPUT_OP);
+      if (info.input_ops.size() < (size_t)info.num_inputs) {
+        info.input_ops.push_back(static_cast<tb::TBInputOp *>(tb_op));
       } else {
-        output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+        info.output_ops.push_back(static_cast<tb::TBInputOp *>(tb_op));
       }
     }
 
-    auto add_events_for_denpendency =
-        [&](std::vector<FullTaskDesc> const &cur_op_tasks,
-            bool nvshmem_event,
-            bool multigpu_task)
-        -> std::map<dim3, std::vector<TaskId>, Dim3Comparator> {
-      std::map<dim3, std::vector<TaskId>, Dim3Comparator> cur_task_map;
-      std::vector<int> producer_partition(mirage::config::MAX_TENSOR_DIMS, 1);
-      std::vector<int> consumer_partition(mirage::config::MAX_TENSOR_DIMS, 1);
-      int num_shared_tensors = 0;
-      int3 input_map, output_map;
-      for (auto const &input : input_ops) {
-        for (auto const &output : pre_output_ops) {
-          if (input->dtensor.guid == output->dtensor.guid) {
-            input_map = input->input_map;
-            output_map = output->input_map;
-            num_shared_tensors++;
-          }
-        }
-      }
-      // assert that their is at least a single tensor shared between ops
-      assert(num_shared_tensors >= 1);
-      for (int d = 0; d < mirage::config::MAX_TENSOR_DIMS; d++) {
-        // ! Note: If two block dimensions are mapped to the same tensor dim,
-        // ! then the partitioning will be incorrect.
-        if (d == input_map.x) {
-          consumer_partition[d] = bgraph.grid_dim.x;
-        }
-        if (d == input_map.y) {
-          consumer_partition[d] = bgraph.grid_dim.y;
-        }
-        if (d == input_map.z) {
-          consumer_partition[d] = bgraph.grid_dim.z;
-        }
-        if (d == output_map.x) {
-          producer_partition[d] = pre_op->bgraph.grid_dim.x;
-        }
-        if (d == output_map.y) {
-          producer_partition[d] = pre_op->bgraph.grid_dim.y;
-        }
-        if (d == output_map.z) {
-          producer_partition[d] = pre_op->bgraph.grid_dim.z;
-        }
-      }
-      // Step 2.2: create events and add tasks
-      // number of events is the product of gcd of producer/consumer
-      std::vector<int> event_dims(mirage::config::MAX_TENSOR_DIMS, 1);
-      for (int d = 0; d < mirage::config::MAX_TENSOR_DIMS; d++) {
-        event_dims[d] = std::gcd(producer_partition[d], consumer_partition[d]);
-      }
-      dfs_create_events_add_tasks(0,         /*depth*/
-                                  my_gpu_id, /*my_gpu_id*/
-                                  num_gpus,
-                                  event_dims,              /*event_dims*/
-                                  input_map,               /*input_map*/
-                                  output_map,              /*output_map*/
-                                  bgraph.grid_dim,         /*consumer_grid_dim*/
-                                  pre_op->bgraph.grid_dim, /*producer_grid_dim*/
-                                  dim3(0, 0, 0),           /*consumer_lo_bid*/
-                                  bgraph.grid_dim,         /*consumer_hi_bid*/
-                                  dim3(0, 0, 0),           /*producer_lo_bid*/
-                                  pre_op->bgraph.grid_dim, /*producer_hi_bid*/
-                                  all_events,
-                                  all_tasks,
-                                  cur_op_tasks,
-                                  pre_task_map, /*pre_task_map*/
-                                  cur_task_map /*cur_task_map)*/,
-                                  nvshmem_events_idx,
-                                  nvshmem_event,
-                                  multigpu_task);
-      return cur_task_map;
-    };
-
-    auto get_tensor_desc =
-        [](threadblock::TBInputOp *const &tb_op) -> TensorDesc {
-      TensorDesc desc;
-      assert(tb_op->output_tensors.size() == 1);
-      tb::STensor stensor = tb_op->output_tensors[0];
-      kn::KNInputOp *kernel_input_op =
-          static_cast<kn::KNInputOp *>(tb_op->dtensor.owner_op);
-      desc.num_dims = stensor.num_dims;
-      desc.data_type = stensor.data_type;
-      for (int d = stensor.num_dims - 1; d >= 0; d--) {
-        desc.dim[d] = stensor.dim[d];
-        desc.stride[d] = kernel_input_op->input_strides[d];
-      }
-      return desc;
-    };
-
-    int cur_op_num_subtasks = get_num_subtasks(num_gpus, task_type);
-    bool cur_op_is_multigpu = (task_type == TASK_NVSHMEM_ALLGATHER_STRIDED_PUT);
-
-    std::vector<FullTaskDesc> tasks;
-    // Step 1: add all tasks based on their blockIdx
-    // (bid.x, bid.y, bid.z) ordering
+    // Create tasks for all block indices
+    int cur_op_num_subtasks = get_num_subtasks(num_gpus, info.task_type);
+    dim3 bid;
     for (bid.x = 0; bid.x < bgraph.grid_dim.x; bid.x++) {
       for (bid.y = 0; bid.y < bgraph.grid_dim.y; bid.y++) {
         for (bid.z = 0; bid.z < bgraph.grid_dim.z; bid.z++) {
+          std::vector<TaskId> task_ids;
           for (int subtask_id = 0; subtask_id < cur_op_num_subtasks;
                subtask_id++) {
-            FullTaskDesc task(task_type, variant_id);
-            // Set request_id for attention and paged_attention
-            if ((task_type == TASK_ATTENTION_1) ||
-                (task_type == TASK_ATTENTION_2) ||
-                (task_type == TASK_SINGLE_BATCH_EXTEND_ATTENTION) ||
-                (task_type == TASK_PAGED_ATTENTION_1) ||
-                (task_type == TASK_PAGED_ATTENTION_2) ||
-                (task_type == TASK_PAGED_ATTENTION_HOPPER) ||
-                (task_type == TASK_PAGED_ATTENTION_SPLIT_KV_SM100) ||
-                (TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_SM100) ||
-                (task_type == TASK_PAGED_ATTENTION_SPLIT_KV_HOPPER) ||
-                (task_type == TASK_ATTN_SM100)) {
-              // Note that we assume grid_dim.x corresponds to
-              // the request dimension
-              task.task_metadata.request_id = bid.x;
-            }
-            // Set expert_offset for MoE tasks
-            if (task_type == TASK_MOE_W13_LINEAR_SM100 ||
-                task_type == TASK_MOE_W2_LINEAR_SM100 ||
-                task_type == TASK_MOE_W13_LINEAR_SM90 ||
-                task_type == TASK_MOE_W2_LINEAR_SM90 ||
-                task_type == TASK_MOE_W13_FP8_SM100 ||
-                task_type == TASK_MOE_W2_FP8_SM100) {
-              task.task_metadata.expert_offset = bid.x;
-            }
-            // Set paged attention split kv task kv_idx
-            if (task_type == TASK_PAGED_ATTENTION_SPLIT_KV_SM100 ||
-                task_type == TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_SM100 ||
-                task_type == TASK_PAGED_ATTENTION_SPLIT_KV_HOPPER) {
-              task.task_metadata.kv_idx = bid.z;
-              task.task_metadata.merge_task_offset = bid.y;
-            }
-            // Set MLA decode metadata: request_id=batch (bid.y), kv_idx=split
-            // (bid.x)
-            if (task_type == TASK_MLA_DECODE_SM100) {
-              task.task_metadata.request_id = bid.y; // batch_idx
-              task.task_metadata.kv_idx = bid.x;     // split_idx
-            }
-            // Set MLA reduce metadata: request_id=batch (bid.x)
-            if (task_type == TASK_MLA_REDUCE_SM100) {
-              task.task_metadata.request_id = bid.x; // batch_idx
-            }
-            // Set MLA prefill metadata: request_id=head (bid.x), kv_idx=q_block
-            // (bid.y)
-            if (task_type == TASK_MLA_PREFILL_SM100) {
-              task.task_metadata.request_id = bid.x; // head
-              task.task_metadata.kv_idx = bid.y;     // q_block
-            }
-            // MTP decode: grid=(sk, num_head_groups, B)
-            // request_id=gi (head_group from bid.y), kv_idx=si (split from
-            // bid.x) expert_offset stores hpb for TMA box dimension
-            if (task_type == TASK_MLA_MTP_DECODE_SM100) {
-              task.task_metadata.kv_idx = bid.x;     // si (split_idx)
-              task.task_metadata.request_id = bid.y; // gi (head_group)
-            }
-            // MTP reduce: grid=(D_V/RD_DV, num_head_groups, B)
-            if (task_type == TASK_MLA_MTP_REDUCE_SM100) {
-              task.task_metadata.kv_idx = bid.x;     // dv_block_idx
-              task.task_metadata.request_id = bid.y; // gi (head_group)
-            }
-            if (task_type == TASK_NVSHMEM_TILE_ALLREDUCE) {
-              task.task_metadata.task_offset =
-                  bid.x + bid.y * bgraph.grid_dim.x +
-                  bid.z * bgraph.grid_dim.x * bgraph.grid_dim.y;
-            }
-            // Initialize input tensors to the task
-            for (auto const &input : input_ops) {
+            FullTaskDesc task(info.task_type, info.variant_id);
+            set_task_metadata(task, info.task_type, bid, bgraph.grid_dim);
+            for (auto const &input : info.input_ops) {
               task.inputs[task.num_inputs++] = get_tensor_desc(input);
             }
-            // Initialize output tensors to the task
-            for (auto const &output : output_ops) {
+            for (auto const &output : info.output_ops) {
               task.outputs[task.num_outputs++] = get_tensor_desc(output);
             }
-            tasks.push_back(task);
+            TaskId task_id = all_tasks.size();
+            all_tasks.push_back(task);
+            task_ids.push_back(task_id);
           }
+          info.task_map[bid] = task_ids;
         }
       }
     }
-    // Step 2: create events between operators
-    std::map<dim3, std::vector<TaskId>, Dim3Comparator> cur_task_map;
-    std::map<dim3, TaskId, Dim3Comparator> cur_task_map_single;
-    if (pre_op == nullptr) {
-      dim3 bid;
-      for (bid.x = 0; bid.x < bgraph.grid_dim.x; bid.x++) {
-        for (bid.y = 0; bid.y < bgraph.grid_dim.y; bid.y++) {
-          for (bid.z = 0; bid.z < bgraph.grid_dim.z; bid.z++) {
-            cur_task_map[bid] = {all_tasks.size()};
 
-            int offset = bid.x * bgraph.grid_dim.y * bgraph.grid_dim.z +
-                         bid.y * bgraph.grid_dim.z + bid.z;
-
-            first_tasks.push_back(all_tasks.size());
-            all_tasks.push_back(tasks[offset]);
-          }
-        }
-      }
-    } else {
-      bool cur_task_trigger_nvshmem_event = prev_op_is_multigpu;
-      cur_task_map = add_events_for_denpendency(
-          tasks, cur_task_trigger_nvshmem_event, cur_op_is_multigpu);
-    }
-    pre_output_ops = output_ops;
-    pre_op = cur_op;
-    pre_task_map = cur_task_map;
-    all_task_maps.emplace(op, cur_task_map);
-    prev_op_is_multigpu = cur_op_is_multigpu;
+    op_to_index[op] = op_infos.size();
+    all_task_maps.emplace(info.raw_op, info.task_map);
+    op_infos.push_back(std::move(info));
   }
 
-  // Update the trigger event for all tasks in pre_task_map
-  for (auto const &it : pre_task_map) {
-    assert(it.second.size() == 1);
-    all_tasks[it.second[0]].trigger_event =
-        get_event_id(my_gpu_id, all_events.size(), false /*nvshmem_event*/);
+  // === Phase 2: Build DAG from tensor GUIDs ===
+  struct DependencyEdge {
+    size_t producer_idx; // index into op_infos
+    size_t consumer_idx;
+    int3 producer_output_map;
+    int3 consumer_input_map;
+    bool producer_is_multigpu;
+  };
+  std::vector<DependencyEdge> edges;
+  std::map<size_t, std::vector<size_t>> predecessor_edges; // consumer → edges
+  std::map<size_t, std::vector<size_t>> successor_edges;   // producer → edges
+
+  for (size_t ci = 0; ci < op_infos.size(); ci++) {
+    auto const &consumer = op_infos[ci];
+    for (auto const &consumer_input : consumer.input_ops) {
+      kn::KNOperator *owner_op = consumer_input->dtensor.owner_op;
+      if (owner_op->op_type == type::KNOperatorType::KN_INPUT_OP) {
+        continue;
+      }
+      auto it = op_to_index.find(owner_op);
+      if (it == op_to_index.end()) {
+        continue;
+      }
+      size_t pi = it->second;
+
+      // Skip if edge already exists for this (producer, consumer) pair
+      bool already_exists = false;
+      if (predecessor_edges.count(ci)) {
+        for (auto ei : predecessor_edges[ci]) {
+          if (edges[ei].producer_idx == pi) {
+            already_exists = true;
+            break;
+          }
+        }
+      }
+      if (already_exists) {
+        continue;
+      }
+
+      // Find matching output TBInputOp in producer's bgraph
+      auto const &producer = op_infos[pi];
+      int3 output_map = {-1, -1, -1};
+      for (auto const &producer_output : producer.output_ops) {
+        if (producer_output->dtensor.guid == consumer_input->dtensor.guid) {
+          output_map = producer_output->input_map;
+          break;
+        }
+      }
+
+      DependencyEdge edge;
+      edge.producer_idx = pi;
+      edge.consumer_idx = ci;
+      edge.producer_output_map = output_map;
+      edge.consumer_input_map = consumer_input->input_map;
+      edge.producer_is_multigpu = producer.is_multigpu;
+
+      size_t edge_idx = edges.size();
+      edges.push_back(edge);
+      predecessor_edges[ci].push_back(edge_idx);
+      successor_edges[pi].push_back(edge_idx);
+    }
+  }
+
+  // Identify root operators and add their tasks to first_tasks
+  for (size_t i = 0; i < op_infos.size(); i++) {
+    if (!predecessor_edges.count(i) || predecessor_edges[i].empty()) {
+      for (auto const &kv : op_infos[i].task_map) {
+        for (auto tid : kv.second) {
+          first_tasks.push_back(tid);
+        }
+      }
+    }
+  }
+
+  // === Phase 3: Create edge events ===
+  struct EdgeEventMapping {
+    std::map<dim3, size_t, Dim3Comparator> producer_bid_to_event;
+    std::map<dim3, size_t, Dim3Comparator> consumer_bid_to_event;
+  };
+  std::vector<EdgeEventMapping> edge_mappings(edges.size());
+
+  for (size_t ei = 0; ei < edges.size(); ei++) {
+    auto const &edge = edges[ei];
+    auto const &producer = op_infos[edge.producer_idx];
+    auto const &consumer = op_infos[edge.consumer_idx];
+
+    dim3 producer_grid = producer.op->bgraph.grid_dim;
+    dim3 consumer_grid = consumer.op->bgraph.grid_dim;
+
+    // Compute GCD-based partition dimensions
+    std::vector<int> producer_partition(mirage::config::MAX_TENSOR_DIMS, 1);
+    std::vector<int> consumer_partition(mirage::config::MAX_TENSOR_DIMS, 1);
+    int3 input_map = edge.consumer_input_map;
+    int3 output_map = edge.producer_output_map;
+
+    for (int d = 0; d < mirage::config::MAX_TENSOR_DIMS; d++) {
+      if (d == input_map.x) consumer_partition[d] = consumer_grid.x;
+      if (d == input_map.y) consumer_partition[d] = consumer_grid.y;
+      if (d == input_map.z) consumer_partition[d] = consumer_grid.z;
+      if (d == output_map.x) producer_partition[d] = producer_grid.x;
+      if (d == output_map.y) producer_partition[d] = producer_grid.y;
+      if (d == output_map.z) producer_partition[d] = producer_grid.z;
+    }
+
+    std::vector<int> event_dims(mirage::config::MAX_TENSOR_DIMS, 1);
+    for (int d = 0; d < mirage::config::MAX_TENSOR_DIMS; d++) {
+      event_dims[d] = std::gcd(producer_partition[d], consumer_partition[d]);
+    }
+
+    bool nvshmem_event = edge.producer_is_multigpu;
+
+    dfs_create_edge_events(0, my_gpu_id, num_gpus, event_dims,
+                           input_map, output_map,
+                           consumer_grid, producer_grid,
+                           dim3(0, 0, 0), consumer_grid,
+                           dim3(0, 0, 0), producer_grid,
+                           all_events,
+                           edge_mappings[ei].producer_bid_to_event,
+                           edge_mappings[ei].consumer_bid_to_event,
+                           nvshmem_events_idx, nvshmem_event,
+                           producer.task_map, all_tasks);
+  }
+
+  // === Phase 4: Create EVENT_END_OF_TASK_GRAPH ===
+  size_t end_event_idx = all_events.size();
+  int total_leaf_tasks = 0;
+  for (size_t i = 0; i < op_infos.size(); i++) {
+    if (!successor_edges.count(i) || successor_edges[i].empty()) {
+      for (auto const &kv : op_infos[i].task_map) {
+        total_leaf_tasks += kv.second.size();
+      }
+    }
   }
   all_events.push_back(
-      EventDesc(EVENT_END_OF_TASK_GRAPH, pre_task_map.size(), 0, 0));
+      EventDesc(EVENT_END_OF_TASK_GRAPH, total_leaf_tasks, 0, 0));
 
-  // Prelaunch all tasks at the begining of an iteration
-  all_events[1].first_task_id = 2;
-  all_events[1].last_task_id = all_tasks.size();
-  for (size_t e = 2; e < all_events.size(); e++) {
-    if (all_events[e].event_type == EVENT_LAUNCH_TASKS ||
-        all_events[e].event_type == EVENT_LAUNCH_MASSIVE_TASKS) {
-      all_events[e].event_type = EVENT_EMPTY;
-      bool is_nvshmem_event = false;
-      if (nvshmem_events_idx.count(e) > 0) {
-        is_nvshmem_event = true;
+  // === Phase 5: Assign trigger events and dependent events ===
+  // Per-task accumulators
+  std::map<TaskId, std::vector<EventId>> task_triggers;
+  std::map<TaskId, std::vector<EventId>> task_dependents;
+
+  for (size_t oi = 0; oi < op_infos.size(); oi++) {
+    auto const &op_info = op_infos[oi];
+    bool is_leaf =
+        !successor_edges.count(oi) || successor_edges[oi].empty();
+
+    for (auto const &kv : op_info.task_map) {
+      dim3 bid = kv.first;
+      auto const &task_ids = kv.second;
+
+      // Collect trigger events from all outgoing edges
+      if (successor_edges.count(oi)) {
+        for (size_t ei : successor_edges[oi]) {
+          auto const &mapping = edge_mappings[ei];
+          auto it = mapping.producer_bid_to_event.find(bid);
+          if (it != mapping.producer_bid_to_event.end()) {
+            size_t evt_idx = it->second;
+            bool nvshmem = nvshmem_events_idx.count(evt_idx) > 0;
+
+            if (op_info.is_multigpu &&
+                op_info.task_type == TASK_NVSHMEM_ALLGATHER_STRIDED_PUT) {
+              // NVSHMEM: each subtask targets a different GPU
+              for (size_t si = 0; si < task_ids.size(); si++) {
+                int tgt_gpu_id =
+                    (int)si < my_gpu_id ? (int)si : (int)si + 1;
+                task_triggers[task_ids[si]].push_back(
+                    get_event_id(tgt_gpu_id, evt_idx, nvshmem));
+              }
+            } else {
+              for (auto tid : task_ids) {
+                task_triggers[tid].push_back(
+                    get_event_id(my_gpu_id, evt_idx, nvshmem));
+              }
+            }
+          }
+        }
       }
-      for (size_t t = all_events[e].first_task_id;
-           t < all_events[e].last_task_id;
-           t++) {
-        all_tasks[t].dependent_event =
-            get_event_id(my_gpu_id, e, is_nvshmem_event /*nvshmem_event*/);
+
+      // Leaf tasks trigger EVENT_END_OF_TASK_GRAPH
+      if (is_leaf) {
+        for (auto tid : task_ids) {
+          task_triggers[tid].push_back(
+              get_event_id(my_gpu_id, end_event_idx, false));
+        }
+      }
+
+      // Collect dependent events from all incoming edges
+      if (predecessor_edges.count(oi)) {
+        for (size_t ei : predecessor_edges[oi]) {
+          auto const &mapping = edge_mappings[ei];
+          auto it = mapping.consumer_bid_to_event.find(bid);
+          if (it != mapping.consumer_bid_to_event.end()) {
+            size_t evt_idx = it->second;
+            bool nvshmem = nvshmem_events_idx.count(evt_idx) > 0;
+            for (auto tid : task_ids) {
+              task_dependents[tid].push_back(
+                  get_event_id(my_gpu_id, evt_idx, nvshmem));
+            }
+          }
+        }
       }
     }
   }
+
+  // === Phase 6: Flatten trigger/dependent arrays into tasks ===
+  for (size_t task_idx = 0; task_idx < all_tasks.size(); task_idx++) {
+    auto &task = all_tasks[task_idx];
+    if (task.task_type == TASK_TERMINATE ||
+        task.task_type == TASK_BEGIN_TASK_GRAPH) {
+      continue; // already set up
+    }
+
+    // Trigger events
+    auto trig_it = task_triggers.find(task_idx);
+    if (trig_it != task_triggers.end() && !trig_it->second.empty()) {
+      task.trigger_events_start = all_trigger_events_vec.size();
+      task.trigger_events_count = trig_it->second.size();
+      for (auto eid : trig_it->second) {
+        all_trigger_events_vec.push_back(eid);
+      }
+    }
+
+    // Dependent events
+    auto dep_it = task_dependents.find(task_idx);
+    if (dep_it != task_dependents.end() && !dep_it->second.empty()) {
+      task.dependent_events_start = all_dependent_events_vec.size();
+      task.dependent_events_count = dep_it->second.size();
+      for (auto eid : dep_it->second) {
+        all_dependent_events_vec.push_back(eid);
+      }
+    }
+  }
+
+  // === Phase 7: Post-processing (pre-launch all tasks) ===
+  // Event at index 1: LAUNCH_DEPENDENT_TASKS dispatches all operator tasks
+  all_events[1].first_task_id = 2;
+  all_events[1].last_task_id = all_tasks.size();
 }
 
 bool sanity_check(mirage::kernel::Graph const &graph,
                   std::vector<FullTaskDesc> const &all_tasks,
                   std::vector<EventDesc> const &all_events,
-                  std::vector<TaskId> const &first_tasks) {
-  std::unordered_set<EventId> triggered_events;
-  std::unordered_set<TaskId> executed_tasks;
-  std::vector<int> event_counts(all_events.size(), 0);
+                  std::vector<TaskId> const &first_tasks,
+                  std::vector<EventId> const &all_trigger_events,
+                  std::vector<EventId> const &all_dependent_events) {
+  // Track event counters (how many triggers remaining)
+  std::vector<int> event_remaining(all_events.size(), 0);
   for (size_t i = 0; i < all_events.size(); i++) {
-    event_counts[i] = all_events[i].num_triggers;
+    event_remaining[i] = all_events[i].num_triggers;
   }
+
+  // Track per-task remaining dependencies
+  std::vector<int> task_deps_remaining(all_tasks.size(), 0);
+  for (size_t t = 0; t < all_tasks.size(); t++) {
+    task_deps_remaining[t] = all_tasks[t].dependent_events_count;
+  }
+
+  // Build reverse map: event_pos -> tasks that depend on it
+  std::map<size_t, std::vector<TaskId>> event_to_waiting_tasks;
+  for (size_t t = 0; t < all_tasks.size(); t++) {
+    for (int d = 0; d < all_tasks[t].dependent_events_count; d++) {
+      EventId eid =
+          all_dependent_events[all_tasks[t].dependent_events_start + d];
+      size_t event_pos = eid & 0xffffffff;
+      event_to_waiting_tasks[event_pos].push_back(t);
+    }
+  }
+
   std::queue<TaskId> task_queue;
-  std::queue<EventId> event_queue;
-  printf("First tasks: %d\n", (int)first_tasks.size());
-  for (size_t i = 0; i < first_tasks.size(); i++) {
-    task_queue.push(first_tasks[i]);
+  std::unordered_set<TaskId> executed_tasks;
+
+  // Seed: TASK_BEGIN_TASK_GRAPH (task 1) has no dependencies
+  task_queue.push(1);
+
+  // Also seed first_tasks (root operator tasks with no dependencies)
+  for (auto tid : first_tasks) {
+    if (task_deps_remaining[tid] == 0) {
+      task_queue.push(tid);
+    }
   }
-  while (!(task_queue.empty() && event_queue.empty())) {
-    // Execute tasks
-    while (!task_queue.empty()) {
-      TaskId task = task_queue.front();
-      task_queue.pop();
-      assert(executed_tasks.count(task) == 0);
-      executed_tasks.insert(task);
-      FullTaskDesc desc = all_tasks[task];
-      if (desc.trigger_event != EVENT_INVALID_ID) {
-        EventId event_id = desc.trigger_event;
-        size_t event_pos = event_id & 0xffffffff;
-        // event_pos 0 is the end of task graph event
-        if (event_pos == 0) {
-          continue;
+
+  while (!task_queue.empty()) {
+    TaskId tid = task_queue.front();
+    task_queue.pop();
+    if (executed_tasks.count(tid)) {
+      continue;
+    }
+    executed_tasks.insert(tid);
+    auto const &task = all_tasks[tid];
+
+    // Process all trigger events
+    for (int te = 0; te < task.trigger_events_count; te++) {
+      EventId eid = all_trigger_events[task.trigger_events_start + te];
+      size_t event_pos = eid & 0xffffffff;
+
+      assert(event_remaining[event_pos] > 0);
+      event_remaining[event_pos]--;
+      if (event_remaining[event_pos] == 0) {
+        // Event fired: check tasks waiting on it
+        if (event_to_waiting_tasks.count(event_pos)) {
+          for (auto dep_tid : event_to_waiting_tasks[event_pos]) {
+            task_deps_remaining[dep_tid]--;
+            if (task_deps_remaining[dep_tid] == 0 &&
+                !executed_tasks.count(dep_tid)) {
+              task_queue.push(dep_tid);
+            }
+          }
         }
-        assert(event_counts[event_pos] > 0);
-        event_counts[event_pos]--;
-        if (event_counts[event_pos] == 0) {
-          event_queue.push(event_id);
+        // Handle scheduler-dispatched events (LAUNCH_DEPENDENT_TASKS)
+        auto const &evt = all_events[event_pos];
+        if (evt.event_type == EVENT_LAUNCH_DEPENDENT_TASKS) {
+          // Pre-launch all tasks in range
+          for (TaskId t = evt.first_task_id; t < evt.last_task_id; t++) {
+            if (task_deps_remaining[t] == 0 && !executed_tasks.count(t)) {
+              task_queue.push(t);
+            }
+          }
         }
       }
     }
-    while (!event_queue.empty()) {
-      EventId event_id = event_queue.front();
-      event_queue.pop();
-      assert(triggered_events.count(event_id) == 0);
-      triggered_events.insert(event_id);
-      size_t event_pos = event_id & 0xffffffff;
-      EventDesc desc = all_events[event_pos];
-      for (TaskId tid = desc.first_task_id; tid < desc.last_task_id; tid++) {
-        task_queue.push(tid);
-      }
-    }
   }
+
   printf("Number of all events: %zu\n", all_events.size());
   printf("Number of all tasks: %zu\n", all_tasks.size());
-  printf("Number of triggered events: %zu\n", triggered_events.size());
   printf("Number of executed tasks: %zu\n", executed_tasks.size());
+  printf("Number of trigger events: %zu\n", all_trigger_events.size());
+  printf("Number of dependent events: %zu\n", all_dependent_events.size());
   return true;
 }
 
@@ -580,6 +705,8 @@ TaskGraphResult print_task_graph(
     std::unordered_map<kn::KNOperator const *,
                        std::tuple<int, int, TaskType, int>> const &task_configs,
     std::map<mirage::type::GuidType, IODesc> const &io_configs,
+    std::vector<EventId> const &all_trigger_events,
+    std::vector<EventId> const &all_dependent_events,
     bool use_json_format) {
   using mirage::runtime::IODesc;
   mirage::transpiler::CodeKeeper code;
@@ -611,6 +738,10 @@ TaskGraphResult print_task_graph(
     code.e("                          std::vector<FullTaskDesc> &all_tasks,");
     code.e("                          std::vector<EventDesc> &all_events,");
     code.e("                          std::vector<TaskId> &first_tasks,");
+    code.e("                          std::vector<EventId> "
+           "&all_trigger_events,");
+    code.e("                          std::vector<EventId> "
+           "&all_dependent_events,");
     code.e("                          std::map<std::string, void*> const "
            "&all_tensors) {");
     code.e("std::filesystem::path file_path(__FILE__);");
@@ -632,20 +763,14 @@ TaskGraphResult print_task_graph(
            "task.at(\"merge_task_offset\").get<int>();");
     code.e("task_desc.task_metadata.task_offset = "
            "task.at(\"task_offset\").get<int>();");
-    code.e("if (task.at(\"trigger_event\").is_number_integer()) {");
-    code.e("task_desc.trigger_event = task.at(\"trigger_event\").get<unsigned "
-           "long long int>();");
-    code.e("}");
-    code.e("else {");
-    code.e("assert(false);");
-    code.e("}");
-    code.e("if (task.at(\"dependent_event\").is_number_integer()) {");
-    code.e("task_desc.dependent_event = "
-           "task.at(\"dependent_event\").get<unsigned long long int>();");
-    code.e("}");
-    code.e("else {");
-    code.e("assert(false);");
-    code.e("}");
+    code.e("task_desc.trigger_events_start = "
+           "task.at(\"trigger_events_start\").get<uint32_t>();");
+    code.e("task_desc.trigger_events_count = "
+           "task.at(\"trigger_events_count\").get<uint16_t>();");
+    code.e("task_desc.dependent_events_start = "
+           "task.at(\"dependent_events_start\").get<uint32_t>();");
+    code.e("task_desc.dependent_events_count = "
+           "task.at(\"dependent_events_count\").get<uint16_t>();");
 
     // load inputs
     code.e("task_desc.num_inputs = 0;");
@@ -721,6 +846,17 @@ TaskGraphResult print_task_graph(
     code.e("for (json const &t : json_task_graph[\"first_tasks\"]) {");
     code.e("first_tasks.push_back(t.get<int>());");
     code.e("}");
+    // load flat trigger/dependent event arrays
+    code.e("for (json const &e : "
+           "json_task_graph[\"all_trigger_events\"]) {");
+    code.e("all_trigger_events.push_back("
+           "e.get<unsigned long long int>());");
+    code.e("}");
+    code.e("for (json const &e : "
+           "json_task_graph[\"all_dependent_events\"]) {");
+    code.e("all_dependent_events.push_back("
+           "e.get<unsigned long long int>());");
+    code.e("}");
     code.e("}");
     code.e("");
   }
@@ -730,6 +866,10 @@ TaskGraphResult print_task_graph(
   code.e("                                    std::vector<EventDesc> "
          "&all_events,");
   code.e("                                  std::vector<TaskId> &first_tasks,");
+  code.e("                                  std::vector<EventId> "
+         "&all_trigger_events,");
+  code.e("                                  std::vector<EventId> "
+         "&all_dependent_events,");
   code.e("                                  int num_gpus,");
   code.e("                                  int my_gpu_id) {");
   code.e("assert(num_gpus = $);", num_gpus);
@@ -826,9 +966,12 @@ TaskGraphResult print_task_graph(
         assert(false);
     }
   }
-  json json_task_graph = {
-      {"all_tasks", {}}, {"all_events", {}}, {"first_tasks", {}}};
-  // generate task[0]
+  json json_task_graph = {{"all_tasks", {}},
+                          {"all_events", {}},
+                          {"first_tasks", {}},
+                          {"all_trigger_events", {}},
+                          {"all_dependent_events", {}}};
+  // generate task[0] (TASK_TERMINATE)
   {
     tgbody.e("all_tasks.push_back(FullTaskDesc(TASK_TERMINATE));");
     json_task_graph["all_tasks"].push_back(
@@ -836,25 +979,29 @@ TaskGraphResult print_task_graph(
              {"variant_id", 0},
              {"inputs", {}},
              {"outputs", {}},
-             {"trigger_event", EVENT_INVALID_ID},
-             {"dependent_event", EVENT_INVALID_ID},
+             {"trigger_events_start", 0},
+             {"trigger_events_count", 0},
+             {"dependent_events_start", 0},
+             {"dependent_events_count", 0},
              {"request_id", -1},
              {"expert_offset", -1},
              {"kv_idx", -1},
              {"merge_task_offset", -1},
              {"task_offset", -1}});
   }
-  // generate task[1]
+  // generate task[1] (TASK_BEGIN_TASK_GRAPH)
   {
+    FullTaskDesc const &begin_task = all_tasks[1];
     tgbody.e("all_tasks.push_back(FullTaskDesc(TASK_BEGIN_TASK_GRAPH));");
     json_task_graph["all_tasks"].push_back(
         json{{"task_type", TASK_BEGIN_TASK_GRAPH},
              {"variant_id", 0},
              {"inputs", {}},
              {"outputs", {}},
-             {"trigger_event",
-              get_event_id(my_gpu_id, 1 /*event_pos*/, false /*is_nvshmem*/)},
-             {"dependent_event", EVENT_INVALID_ID},
+             {"trigger_events_start", begin_task.trigger_events_start},
+             {"trigger_events_count", begin_task.trigger_events_count},
+             {"dependent_events_start", begin_task.dependent_events_start},
+             {"dependent_events_count", begin_task.dependent_events_count},
              {"request_id", -1},
              {"expert_offset", -1},
              {"kv_idx", -1},
@@ -912,20 +1059,16 @@ TaskGraphResult print_task_graph(
             tgbody.e("{");
             tgbody.e("FullTaskDesc task_desc(static_cast<TaskType>($));",
                      task_desc.task_type);
-            size_t event_gpu_id = ((task_desc.trigger_event >> 32) & 0xffff);
-            size_t event_pos = (task_desc.trigger_event & 0xffffffff);
-            bool is_nvshmem_event =
-                ((task_desc.trigger_event & EVENT_NVSHMEM_TAG) > 0);
-            // assert(event_gpu_id == my_gpu_id);
-            // assert(!is_nvshmem_event);
             json json_task;
             json_task = {
                 {"task_type", task_desc.task_type},
                 {"variant_id", task_desc.variant_id},
                 {"inputs", {}},
                 {"outputs", {}},
-                {"trigger_event", task_desc.trigger_event},
-                {"dependent_event", task_desc.dependent_event},
+                {"trigger_events_start", task_desc.trigger_events_start},
+                {"trigger_events_count", task_desc.trigger_events_count},
+                {"dependent_events_start", task_desc.dependent_events_start},
+                {"dependent_events_count", task_desc.dependent_events_count},
                 {"request_id", task_desc.task_metadata.request_id},
                 {"expert_offset", task_desc.task_metadata.expert_offset},
                 {"kv_idx", task_desc.task_metadata.kv_idx},
@@ -1207,11 +1350,19 @@ TaskGraphResult print_task_graph(
     tgbody.e("first_tasks.push_back($);", task);
     json_task_graph["first_tasks"].push_back(task);
   }
+  // Serialize flat trigger/dependent event arrays
+  for (auto const &eid : all_trigger_events) {
+    json_task_graph["all_trigger_events"].push_back(eid);
+  }
+  for (auto const &eid : all_dependent_events) {
+    json_task_graph["all_dependent_events"].push_back(eid);
+  }
   if (use_json_format) {
     // Add nullptr for tensors set as None
     code.e("all_tensors[\"nullptr\"] = nullptr;");
     code.e("construct_task_graph(num_gpus, my_gpu_id, all_tasks, all_events, "
-           "first_tasks, all_tensors);");
+           "first_tasks, all_trigger_events, all_dependent_events, "
+           "all_tensors);");
   } else {
     code.e(tgbody.to_string());
   }
@@ -1328,6 +1479,8 @@ TaskGraphResult Graph::generate_task_graph(int _num_gpus, int _my_gpu_id) {
   std::vector<FullTaskDesc> all_tasks;
   std::vector<EventDesc> all_events;
   std::vector<TaskId> first_tasks;
+  std::vector<EventId> all_trigger_events;
+  std::vector<EventId> all_dependent_events;
   int num_gpus, my_gpu_id;
   std::map<kernel::KNOperator *,
            std::map<dim3, std::vector<TaskId>, Dim3Comparator>>
@@ -1346,8 +1499,11 @@ TaskGraphResult Graph::generate_task_graph(int _num_gpus, int _my_gpu_id) {
                    all_events,
                    first_tasks,
                    all_task_maps,
-                   task_config);
-  assert(sanity_check(*this, all_tasks, all_events, first_tasks));
+                   task_config,
+                   all_trigger_events,
+                   all_dependent_events);
+  assert(sanity_check(*this, all_tasks, all_events, first_tasks,
+                      all_trigger_events, all_dependent_events));
   return print_task_graph(*this,
                           num_gpus,
                           my_gpu_id,
@@ -1357,6 +1513,8 @@ TaskGraphResult Graph::generate_task_graph(int _num_gpus, int _my_gpu_id) {
                           all_task_maps,
                           task_config,
                           io_config,
+                          all_trigger_events,
+                          all_dependent_events,
                           true /*use_json_format*/);
 }
 

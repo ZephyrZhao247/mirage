@@ -579,7 +579,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
           printf(
               "[%d][FTCH] worker_id(%d) queue_idx(%d) next_task_pos(%llu, "
               "%llu) last_task_pos(%llu, %llu) "
-              "task_id(%llu) task_type(%d) event_id(%llx) \n",
+              "task_id(%llu) task_type(%d) trigger_count(%d) \n",
               config.my_gpu_id,
               worker_id,
               queue_idx,
@@ -590,7 +590,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
               get_task_position_index(task_ids[i]),
               config.all_tasks[get_task_position_index(task_ids[i])].task_type,
               config.all_tasks[get_task_position_index(task_ids[i])]
-                  .trigger_event);
+                  .trigger_events_count);
         }
 #endif
         next_task_pos[queue_idx] += num_loaded_tasks;
@@ -616,10 +616,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
     }
     TaskDesc *task_desc = task_descs + queue_pos;
     // Make sure task is ready before start execution
+    // Supports multi-dependent for DAG fan-in: wait on each event sequentially
     if (threadIdx.x == 0) {
-      if (task_desc->dependent_event != EVENT_INVALID_ID) {
-        // Wait until the event has been triggered enough times
-        EventId event_id = task_desc->dependent_event;
+      for (int _de = 0; _de < task_desc->dependent_events_count; _de++) {
+        EventId event_id =
+            config.all_dependent_events[task_desc->dependent_events_start +
+                                        _de];
         assert(get_event_gpu_id(event_id) == config.my_gpu_id);
         size_t event_index = get_event_position_index(event_id);
         EventCounter needed_counts =
@@ -675,94 +677,85 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
     }
 #endif
 
-    // Trigger event
+    // Trigger events (supports multi-trigger for DAG fan-out)
     if (threadIdx.x == 0) {
-      EventId event_id = task_desc->trigger_event;
-      size_t event_index = get_event_position_index(event_id);
-      if (!is_nvshmem_event(event_id)) {
-        size_t gpu_id = get_event_gpu_id(event_id);
-        assert(gpu_id == config.my_gpu_id);
-        // Case 1: Trigger a local non-nvshmem event
-        // int count = atomicSub(&config.all_event_counters[event_index], 1);
-        EventCounter count = atom_add_release_gpu_u64(
-            &config.all_event_counters[event_index], 1);
-        int num_triggers = config.all_event_num_triggers[event_index];
+      for (int _te = 0; _te < task_desc->trigger_events_count; _te++) {
+        EventId event_id =
+            config.all_trigger_events[task_desc->trigger_events_start + _te];
+        size_t event_index = get_event_position_index(event_id);
+        if (!is_nvshmem_event(event_id)) {
+          size_t gpu_id = get_event_gpu_id(event_id);
+          assert(gpu_id == config.my_gpu_id);
+          EventCounter count = atom_add_release_gpu_u64(
+              &config.all_event_counters[event_index], 1);
+          int num_triggers = config.all_event_num_triggers[event_index];
 #ifdef MPK_ENABLE_VERBOSE
-        printf("[%d][DONE] worker_id(%d) iter_num(%llu) task_idx(%llu) "
-               "event_id(%llu) "
-               "event_type(local) count(%llu)\n",
-               config.my_gpu_id,
-               worker_id,
-               get_task_iteration_num(task_ids[queue_pos]),
-               get_task_position_index(task_ids[queue_pos]),
-               event_id,
-               count);
+          printf("[%d][DONE] worker_id(%d) iter_num(%llu) task_idx(%llu) "
+                 "event_id(%llu) "
+                 "event_type(local) count(%llu) trigger(%d/%d)\n",
+                 config.my_gpu_id,
+                 worker_id,
+                 get_task_iteration_num(task_ids[queue_pos]),
+                 get_task_position_index(task_ids[queue_pos]),
+                 event_id,
+                 count,
+                 _te,
+                 task_desc->trigger_events_count);
 #endif
 
-        if ((count + 1) == static_cast<EventCounter>(num_triggers) *
-                               get_task_iteration_num(task_ids[queue_pos])) {
+          if ((count + 1) == static_cast<EventCounter>(num_triggers) *
+                                 get_task_iteration_num(task_ids[queue_pos])) {
 #ifdef MPK_ENABLE_PROFILING
-          PROFILER_EVENT_START(TASK_SCHD_EVENTS, task_counter);
+            PROFILER_EVENT_START(TASK_SCHD_EVENTS, task_counter);
 #endif
-          EventDesc event_desc = config.all_events[event_index];
-          // The event has been triggered enough times
-          // Refresh the event counter
-          // atom_add_release_gpu_u64(&config.all_event_counters[event_index],
-          //                       event_desc.num_triggers);
-          // Add the event to the schedule_queue
-          // Note that events launching massive tasks are scheduled
-          // to the global sched_queue
-          if (event_desc.event_type == EVENT_EMPTY) {
-            // Do nothing for empty event
-          } else {
-            bool use_bcast_queue = false;
-            if (event_desc.event_type == EVENT_LAUNCH_MASSIVE_TASKS ||
-                event_desc.event_type == EVENT_LAUNCH_DEPENDENT_TASKS) {
-              use_bcast_queue = true;
+            EventDesc event_desc = config.all_events[event_index];
+            if (event_desc.event_type == EVENT_EMPTY) {
+              // Do nothing for empty event (barrier-only)
+            } else {
+              bool use_bcast_queue = false;
+              if (event_desc.event_type == EVENT_LAUNCH_MASSIVE_TASKS ||
+                  event_desc.event_type == EVENT_LAUNCH_DEPENDENT_TASKS) {
+                use_bcast_queue = true;
+              }
+              int sched_id =
+                  use_bcast_queue
+                      ? config.num_local_schedulers +
+                            config.num_remote_schedulers
+                      : get_rand_sched_id(event_index,
+                                          worker_id,
+                                          config.num_workers,
+                                          config.num_local_schedulers);
+              size_t last_event_pos = atom_add_release_gpu_u64(
+                  &config.sched_queue_next_free_event_id[sched_id], 1);
+              st_relaxed_gpu_u64(
+                  &config.sched_queues[sched_id][last_event_pos %
+                                                 config.per_sched_queue_len],
+                  event_index);
+              size_t old;
+              do {
+                old = atom_cas_release_gpu_u64(
+                    &config.sched_queue_last_ready_event_id[sched_id],
+                    last_event_pos,
+                    last_event_pos + 1);
+              } while (old != last_event_pos);
             }
-            int sched_id =
-                use_bcast_queue
-                    ? config.num_local_schedulers + config.num_remote_schedulers
-                    : get_rand_sched_id(event_index,
-                                        worker_id,
-                                        config.num_workers,
-                                        config.num_local_schedulers);
-            size_t last_event_pos = atom_add_release_gpu_u64(
-                &config.sched_queue_next_free_event_id[sched_id], 1);
-            st_relaxed_gpu_u64(
-                &config.sched_queues[sched_id][last_event_pos %
-                                               config.per_sched_queue_len],
-                event_index);
-            // Use st.relaxed to make sure that the updated event_index is
-            // visible to the scheduler CTA before updating its
-            // last_ready_event_id
-            size_t old;
-            do {
-              old = atom_cas_release_gpu_u64(
-                  &config.sched_queue_last_ready_event_id[sched_id],
-                  last_event_pos,
-                  last_event_pos + 1);
-            } while (old != last_event_pos);
-          }
 #ifdef MPK_ENABLE_PROFILING
-          PROFILER_EVENT_END(TASK_SCHD_EVENTS, task_counter++);
+            PROFILER_EVENT_END(TASK_SCHD_EVENTS, task_counter++);
+#endif
+          }
+        } else {
+          // NVSHMEM event: signal handled during data copy
+          assert(task_desc->task_type == TASK_NVSHMEM_ALLGATHER_STRIDED_PUT);
+#ifdef MPK_ENABLE_VERBOSE
+          printf("[%d][DONE] worker_id(%d) task_id(%llu) event_id(%llx) "
+                 "event_type(remote)\n",
+                 config.my_gpu_id,
+                 worker_id,
+                 get_task_position_index(task_ids[queue_pos]),
+                 event_id);
 #endif
         }
-      } else {
-        // Case 2: trigger a nvshmem event
-        // TODO(Zepeng): This branch is no longer used. Sanitize later.
-        assert(task_desc->task_type == TASK_NVSHMEM_ALLGATHER_STRIDED_PUT);
-        // Note that nvshmem copy task signal counter during data copy
-        // we don't need to do anything here is the task type is NVSHMEM_COPY
-#ifdef MPK_ENABLE_VERBOSE
-        printf("[%d][DONE] worker_id(%d) task_id(%llu) event_id(%llx) "
-               "event_type(remote)\n",
-               config.my_gpu_id,
-               worker_id,
-               get_task_position_index(task_ids[queue_pos]),
-               event_id);
-#endif
-      }
+      } // end for each trigger event
     }
     queue_pos += 1;
   }
@@ -1087,6 +1080,8 @@ void gpu_free(void *ptr) {
 static void _init_persistent_kernel(std::vector<FullTaskDesc> &all_tasks,
                                     std::vector<EventDesc> &all_events,
                                     std::vector<TaskId> &first_tasks,
+                                    std::vector<EventId> &all_trigger_events,
+                                    std::vector<EventId> &all_dependent_events,
                                     int num_gpus,
                                     int my_gpu_id);
 
@@ -1210,7 +1205,11 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   std::vector<FullTaskDesc> all_fulltasks;
   std::vector<EventDesc> all_events;
   std::vector<TaskId> first_tasks;
-  _init_persistent_kernel(all_fulltasks, all_events, first_tasks, npes, mype);
+  std::vector<EventId> all_trigger_events_vec;
+  std::vector<EventId> all_dependent_events_vec;
+  _init_persistent_kernel(all_fulltasks, all_events, first_tasks,
+                          all_trigger_events_vec, all_dependent_events_vec,
+                          npes, mype);
   std::vector<TaskDesc> all_tasks;
   for (auto const &ft : all_fulltasks) {
     TaskDesc task_desc(ft);
@@ -1287,6 +1286,31 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
              all_events.data(),
              all_events.size() * sizeof(EventDesc),
              cudaMemcpyHostToDevice);
+  // Initialize flat trigger/dependent event arrays (DAG support)
+  global_runtime_config.num_trigger_events =
+      (int)all_trigger_events_vec.size();
+  global_runtime_config.num_dependent_events =
+      (int)all_dependent_events_vec.size();
+  if (!all_trigger_events_vec.empty()) {
+    global_runtime_config.all_trigger_events = gpu_malloc<EventId>(
+        all_trigger_events_vec.size() * sizeof(EventId));
+    cudaMemcpy(global_runtime_config.all_trigger_events,
+               all_trigger_events_vec.data(),
+               all_trigger_events_vec.size() * sizeof(EventId),
+               cudaMemcpyHostToDevice);
+  } else {
+    global_runtime_config.all_trigger_events = nullptr;
+  }
+  if (!all_dependent_events_vec.empty()) {
+    global_runtime_config.all_dependent_events = gpu_malloc<EventId>(
+        all_dependent_events_vec.size() * sizeof(EventId));
+    cudaMemcpy(global_runtime_config.all_dependent_events,
+               all_dependent_events_vec.data(),
+               all_dependent_events_vec.size() * sizeof(EventId),
+               cudaMemcpyHostToDevice);
+  } else {
+    global_runtime_config.all_dependent_events = nullptr;
+  }
   // Initialize worker queues
   {
     std::vector<TaskId *> host_worker_queues;

@@ -193,7 +193,8 @@ struct EventDesc {
 struct FullTaskDesc {
   FullTaskDesc(TaskType t, int _variant_id)
       : task_type(t), variant_id(_variant_id), num_inputs(0), num_outputs(0),
-        trigger_event(EVENT_INVALID_ID), dependent_event(EVENT_INVALID_ID) {
+        trigger_events_start(0), trigger_events_count(0), _trigger_pad(0),
+        dependent_events_start(0), dependent_events_count(0), _dep_pad(0) {
     task_metadata.raw_payload = ~0ull;
   }
   FullTaskDesc() {
@@ -202,8 +203,20 @@ struct FullTaskDesc {
   TaskType task_type;
   unsigned variant_id;
   int num_inputs, num_outputs;
-  EventId trigger_event;
-  EventId dependent_event;
+  // Trigger events: fan-out support (flat array indirection)
+  // For 1-way tasks: count=1, start indexes single entry in flat array
+  // For N-way fork: count=N, start indexes N contiguous entries
+  // For tasks with no trigger (TASK_TERMINATE): count=0
+  uint32_t trigger_events_start;  // index into RuntimeConfig::all_trigger_events
+  uint16_t trigger_events_count;  // number of trigger events
+  uint16_t _trigger_pad;
+  // Dependent events: fan-in support (flat array indirection)
+  // For 1-way tasks: count=1, start indexes single entry in flat array
+  // For N-way join: count=N, start indexes N contiguous entries
+  // For tasks with no dependency (root tasks): count=0
+  uint32_t dependent_events_start;  // index into RuntimeConfig::all_dependent_events
+  uint16_t dependent_events_count;  // number of dependent events
+  uint16_t _dep_pad;
   TensorDesc inputs[MAX_INPUTS_PER_TASK];
   TensorDesc outputs[MAX_OUTPUTS_PER_TASK];
   union TaskMetadata {
@@ -229,7 +242,12 @@ static_assert(
 struct alignas(16) TaskDesc {
   TaskDesc(FullTaskDesc t)
       : task_type(t.task_type), variant_id(t.variant_id),
-        trigger_event(t.trigger_event), dependent_event(t.dependent_event),
+        trigger_events_start(t.trigger_events_start),
+        trigger_events_count(t.trigger_events_count),
+        _trigger_pad(t._trigger_pad),
+        dependent_events_start(t.dependent_events_start),
+        dependent_events_count(t.dependent_events_count),
+        _dep_pad(t._dep_pad),
         task_metadata(t.task_metadata) {
     for (int i = 0; i < t.num_inputs; i++) {
       input_ptrs[i] = t.inputs[i].base_ptr;
@@ -255,8 +273,14 @@ struct alignas(16) TaskDesc {
   }
   TaskType task_type;
   unsigned variant_id;
-  EventId trigger_event;
-  EventId dependent_event;
+  // Trigger events (flat array indirection, same 8 bytes as old EventId)
+  uint32_t trigger_events_start;
+  uint16_t trigger_events_count;
+  uint16_t _trigger_pad;
+  // Dependent events (flat array indirection, same 8 bytes as old EventId)
+  uint32_t dependent_events_start;
+  uint16_t dependent_events_count;
+  uint16_t _dep_pad;
   void *input_ptrs[MAX_INPUTS_PER_TASK];
   void *output_ptrs[MAX_OUTPUTS_PER_TASK];
 #ifdef MPK_ENABLE_TMA
@@ -283,6 +307,11 @@ struct RuntimeConfig {
   TaskId **worker_queues;
   EventId **sched_queues;
   TaskId *first_tasks;
+  // DAG support: flat arrays for multi-trigger and multi-dependent events
+  EventId *all_trigger_events;     // flat array indexed by trigger_events_start
+  EventId *all_dependent_events;   // flat array indexed by dependent_events_start
+  int num_trigger_events;          // total entries in all_trigger_events
+  int num_dependent_events;        // total entries in all_dependent_events
   int *step;                    // Metadata for LLM serving
   long long *tokens;            // Metadata for LLM serving
   long long *input_tokens;      // Metadata for LLM serving

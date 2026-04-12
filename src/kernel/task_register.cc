@@ -3563,11 +3563,14 @@ int TaskRegister::register_nvshmem_allgather_strided_put_task(
   // Register nvshmem copy task (allgather)
   mirage::transpiler::CodeKeeper c;
   c.inc_indent();
+  c.e("// Read trigger event from flat array for NVSHMEM task");
+  c.e("EventId _nvshmem_trigger_event = "
+      "runtime_config.all_trigger_events[task_desc->trigger_events_start];");
   c.e("size_t event_index = "
-      "get_event_position_index(task_desc->trigger_event);");
+      "get_event_position_index(_nvshmem_trigger_event);");
   c.inc_indent();
   c.e("int target_gpu_id = "
-      "static_cast<int>(get_event_gpu_id(task_desc->trigger_event));");
+      "static_cast<int>(get_event_gpu_id(_nvshmem_trigger_event));");
   c.e("nvshmem_allgather_strided_put<bfloat16, $, $, $>(",
       batch_size,
       output_size,
