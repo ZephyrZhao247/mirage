@@ -616,12 +616,26 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
     }
     TaskDesc *task_desc = task_descs + queue_pos;
     // Make sure task is ready before start execution
-    // Supports multi-dependent for DAG fan-in: wait on each event sequentially
+    // Bit-63 discriminator: 0 → no dep; bit63=0 → 1-way; bit63=1 → N-way
     if (threadIdx.x == 0) {
-      for (int _de = 0; _de < task_desc->dependent_events_count; _de++) {
-        EventId event_id =
-            config.all_dependent_events[task_desc->dependent_events_start +
-                                        _de];
+      EventId _dep_raw = task_desc->dependent_event;
+      int _num_deps;
+      if (_dep_raw == 0) {
+        _num_deps = 0; // No dependency (root task)
+      } else if (_dep_raw & EVENT_MULTI_FLAG) {
+        _num_deps = task_desc->dependent_events_count; // N-way
+      } else {
+        _num_deps = 1; // 1-way direct EventId
+      }
+      for (int _de = 0; _de < _num_deps; _de++) {
+        EventId event_id;
+        if (!(_dep_raw & EVENT_MULTI_FLAG)) {
+          event_id = _dep_raw; // 1-way: direct EventId
+        } else {
+          event_id =
+              config.all_dependent_events[task_desc->dependent_events_start +
+                                          _de];
+        }
         assert(get_event_gpu_id(event_id) == config.my_gpu_id);
         size_t event_index = get_event_position_index(event_id);
         EventCounter needed_counts =
@@ -678,10 +692,25 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
 #endif
 
     // Trigger events (supports multi-trigger for DAG fan-out)
+    // Bit-63 discriminator: 0 → direct EventId or no event; 1 → N-way flat array
     if (threadIdx.x == 0) {
-      for (int _te = 0; _te < task_desc->trigger_events_count; _te++) {
-        EventId event_id =
-            config.all_trigger_events[task_desc->trigger_events_start + _te];
+      EventId _trig_raw = task_desc->trigger_event;
+      int _num_triggers_to_fire;
+      if (_trig_raw == 0) {
+        _num_triggers_to_fire = 0; // No trigger events
+      } else if (_trig_raw & EVENT_MULTI_FLAG) {
+        _num_triggers_to_fire = task_desc->trigger_events_count; // N-way
+      } else {
+        _num_triggers_to_fire = 1; // 1-way direct EventId
+      }
+      for (int _te = 0; _te < _num_triggers_to_fire; _te++) {
+        EventId event_id;
+        if (!(_trig_raw & EVENT_MULTI_FLAG)) {
+          event_id = _trig_raw; // 1-way: direct EventId
+        } else {
+          event_id =
+              config.all_trigger_events[task_desc->trigger_events_start + _te];
+        }
         size_t event_index = get_event_position_index(event_id);
         if (!is_nvshmem_event(event_id)) {
           size_t gpu_id = get_event_gpu_id(event_id);
@@ -700,7 +729,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
                  event_id,
                  count,
                  _te,
-                 task_desc->trigger_events_count);
+                 _num_triggers_to_fire);
 #endif
 
           if ((count + 1) == static_cast<EventCounter>(num_triggers) *

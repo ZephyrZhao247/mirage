@@ -277,10 +277,10 @@ void register_mugraph(
     size_t begin_event_idx = all_events.size();
     EventDesc e(EVENT_LAUNCH_DEPENDENT_TASKS, 1, 0, 0);
     FullTaskDesc t(TASK_BEGIN_TASK_GRAPH, 0 /*variant_id*/);
-    t.trigger_events_start = all_trigger_events_vec.size();
-    t.trigger_events_count = 1;
-    all_trigger_events_vec.push_back(
-        get_event_id(my_gpu_id, begin_event_idx, false));
+    // Single-GPU, 1-way: write trigger_event directly (count stays 0)
+    t.trigger_event = get_event_id(my_gpu_id, begin_event_idx, false);
+    // No dependency: dependent_event = 0
+    t.dependent_event = 0;
     all_tasks.push_back(t);
     all_events.push_back(e);
   }
@@ -363,6 +363,9 @@ void register_mugraph(
   }
 
   // === Phase 2: Build DAG from tensor GUIDs ===
+  // In MPK, dependencies are tracked via shared DTensor GUIDs between
+  // operators' output TBInputOps and subsequent operators' input TBInputOps.
+  // (owner_op is NOT reliable in MPK — bgraphs have no TB_OUTPUT_OP.)
   struct DependencyEdge {
     size_t producer_idx; // index into op_infos
     size_t consumer_idx;
@@ -374,18 +377,25 @@ void register_mugraph(
   std::map<size_t, std::vector<size_t>> predecessor_edges; // consumer → edges
   std::map<size_t, std::vector<size_t>> successor_edges;   // producer → edges
 
+  // Map: tensor GUID → (producer op index, output TBInputOp)
+  struct ProducerInfo {
+    size_t op_idx;
+    tb::TBInputOp *output_tb_op;
+  };
+  std::unordered_map<mirage::type::GuidType, ProducerInfo>
+      tensor_guid_to_producer;
+
   for (size_t ci = 0; ci < op_infos.size(); ci++) {
     auto const &consumer = op_infos[ci];
+
+    // Check each input TBInputOp's GUID against known producers
     for (auto const &consumer_input : consumer.input_ops) {
-      kn::KNOperator *owner_op = consumer_input->dtensor.owner_op;
-      if (owner_op->op_type == type::KNOperatorType::KN_INPUT_OP) {
-        continue;
+      auto it = tensor_guid_to_producer.find(consumer_input->dtensor.guid);
+      if (it == tensor_guid_to_producer.end()) {
+        continue; // Global input (weight, etc.) — no predecessor
       }
-      auto it = op_to_index.find(owner_op);
-      if (it == op_to_index.end()) {
-        continue;
-      }
-      size_t pi = it->second;
+      size_t pi = it->second.op_idx;
+      int3 output_map = it->second.output_tb_op->input_map;
 
       // Skip if edge already exists for this (producer, consumer) pair
       bool already_exists = false;
@@ -401,16 +411,7 @@ void register_mugraph(
         continue;
       }
 
-      // Find matching output TBInputOp in producer's bgraph
       auto const &producer = op_infos[pi];
-      int3 output_map = {-1, -1, -1};
-      for (auto const &producer_output : producer.output_ops) {
-        if (producer_output->dtensor.guid == consumer_input->dtensor.guid) {
-          output_map = producer_output->input_map;
-          break;
-        }
-      }
-
       DependencyEdge edge;
       edge.producer_idx = pi;
       edge.consumer_idx = ci;
@@ -422,6 +423,12 @@ void register_mugraph(
       edges.push_back(edge);
       predecessor_edges[ci].push_back(edge_idx);
       successor_edges[pi].push_back(edge_idx);
+    }
+
+    // Register this op's output TBInputOps as producers
+    for (auto const &output_tb_op : consumer.output_ops) {
+      tensor_guid_to_producer[output_tb_op->dtensor.guid] = {ci,
+                                                              output_tb_op};
     }
   }
 
@@ -567,6 +574,10 @@ void register_mugraph(
   }
 
   // === Phase 6: Flatten trigger/dependent arrays into tasks ===
+  // Union convention:
+  //   count == 0 → use trigger_event / dependent_event directly (1-way fast path)
+  //   count >  0 → use flat array via start/count (N-way or multi-GPU)
+  // Root tasks (no deps): dependent_event = 0 (count stays 0, start=0)
   for (size_t task_idx = 0; task_idx < all_tasks.size(); task_idx++) {
     auto &task = all_tasks[task_idx];
     if (task.task_type == TASK_TERMINATE ||
@@ -574,25 +585,45 @@ void register_mugraph(
       continue; // already set up
     }
 
-    // Trigger events
+    // Trigger events — bit-63 discriminator
     auto trig_it = task_triggers.find(task_idx);
     if (trig_it != task_triggers.end() && !trig_it->second.empty()) {
-      task.trigger_events_start = all_trigger_events_vec.size();
-      task.trigger_events_count = trig_it->second.size();
-      for (auto eid : trig_it->second) {
-        all_trigger_events_vec.push_back(eid);
+      auto const &trigs = trig_it->second;
+      if (trigs.size() == 1) {
+        // 1-way: write EventId directly (bit 63 = 0 for all valid EventIds)
+        task.trigger_event = trigs[0];
+      } else {
+        // N-way: use flat array, set bit-63 flag via _trigger_pad
+        task.trigger_events_start =
+            static_cast<uint32_t>(all_trigger_events_vec.size());
+        task.trigger_events_count = static_cast<uint16_t>(trigs.size());
+        task._trigger_pad = 0x8000; // sets bit 63 of the union
+        for (auto eid : trigs) {
+          all_trigger_events_vec.push_back(eid);
+        }
       }
     }
+    // else: trigger_event stays 0 (no triggers)
 
-    // Dependent events
+    // Dependent events — same bit-63 pattern
     auto dep_it = task_dependents.find(task_idx);
     if (dep_it != task_dependents.end() && !dep_it->second.empty()) {
-      task.dependent_events_start = all_dependent_events_vec.size();
-      task.dependent_events_count = dep_it->second.size();
-      for (auto eid : dep_it->second) {
-        all_dependent_events_vec.push_back(eid);
+      auto const &deps = dep_it->second;
+      if (deps.size() == 1) {
+        // 1-way: write EventId directly
+        task.dependent_event = deps[0];
+      } else {
+        // N-way: use flat array, set bit-63 flag
+        task.dependent_events_start =
+            static_cast<uint32_t>(all_dependent_events_vec.size());
+        task.dependent_events_count = static_cast<uint16_t>(deps.size());
+        task._dep_pad = 0x8000; // sets bit 63 of the union
+        for (auto eid : deps) {
+          all_dependent_events_vec.push_back(eid);
+        }
       }
     }
+    // else: dependent_event stays 0 (no dependencies, root task)
   }
 
   // === Phase 7: Post-processing (pre-launch all tasks) ===
@@ -613,18 +644,54 @@ bool sanity_check(mirage::kernel::Graph const &graph,
     event_remaining[i] = all_events[i].num_triggers;
   }
 
+  // Helper: get all trigger EventIds for a task (bit-63 union discriminator)
+  auto get_trigger_events = [&](FullTaskDesc const &task)
+      -> std::vector<EventId> {
+    EventId raw = task.trigger_event;
+    if (raw == 0) {
+      return {};
+    } else if (raw & EVENT_MULTI_FLAG) {
+      // N-way: read from flat array
+      std::vector<EventId> result;
+      for (int i = 0; i < task.trigger_events_count; i++) {
+        result.push_back(
+            all_trigger_events[task.trigger_events_start + i]);
+      }
+      return result;
+    } else {
+      return {raw}; // 1-way direct EventId
+    }
+  };
+
+  // Helper: get all dependent EventIds for a task (bit-63 union discriminator)
+  auto get_dependent_events = [&](FullTaskDesc const &task)
+      -> std::vector<EventId> {
+    EventId raw = task.dependent_event;
+    if (raw == 0) {
+      return {}; // no dependency
+    } else if (raw & EVENT_MULTI_FLAG) {
+      // N-way: read from flat array
+      std::vector<EventId> result;
+      for (int i = 0; i < task.dependent_events_count; i++) {
+        result.push_back(
+            all_dependent_events[task.dependent_events_start + i]);
+      }
+      return result;
+    } else {
+      return {raw}; // 1-way direct EventId
+    }
+  };
+
   // Track per-task remaining dependencies
   std::vector<int> task_deps_remaining(all_tasks.size(), 0);
   for (size_t t = 0; t < all_tasks.size(); t++) {
-    task_deps_remaining[t] = all_tasks[t].dependent_events_count;
+    task_deps_remaining[t] = (int)get_dependent_events(all_tasks[t]).size();
   }
 
   // Build reverse map: event_pos -> tasks that depend on it
   std::map<size_t, std::vector<TaskId>> event_to_waiting_tasks;
   for (size_t t = 0; t < all_tasks.size(); t++) {
-    for (int d = 0; d < all_tasks[t].dependent_events_count; d++) {
-      EventId eid =
-          all_dependent_events[all_tasks[t].dependent_events_start + d];
+    for (auto eid : get_dependent_events(all_tasks[t])) {
       size_t event_pos = eid & 0xffffffff;
       event_to_waiting_tasks[event_pos].push_back(t);
     }
@@ -653,8 +720,7 @@ bool sanity_check(mirage::kernel::Graph const &graph,
     auto const &task = all_tasks[tid];
 
     // Process all trigger events
-    for (int te = 0; te < task.trigger_events_count; te++) {
-      EventId eid = all_trigger_events[task.trigger_events_start + te];
+    for (auto eid : get_trigger_events(task)) {
       size_t event_pos = eid & 0xffffffff;
 
       assert(event_remaining[event_pos] > 0);
@@ -763,14 +829,10 @@ TaskGraphResult print_task_graph(
            "task.at(\"merge_task_offset\").get<int>();");
     code.e("task_desc.task_metadata.task_offset = "
            "task.at(\"task_offset\").get<int>();");
-    code.e("task_desc.trigger_events_start = "
-           "task.at(\"trigger_events_start\").get<uint32_t>();");
-    code.e("task_desc.trigger_events_count = "
-           "task.at(\"trigger_events_count\").get<uint16_t>();");
-    code.e("task_desc.dependent_events_start = "
-           "task.at(\"dependent_events_start\").get<uint32_t>();");
-    code.e("task_desc.dependent_events_count = "
-           "task.at(\"dependent_events_count\").get<uint16_t>();");
+    code.e("task_desc.trigger_event = "
+           "task.at(\"trigger_event\").get<unsigned long long int>();");
+    code.e("task_desc.dependent_event = "
+           "task.at(\"dependent_event\").get<unsigned long long int>();");
 
     // load inputs
     code.e("task_desc.num_inputs = 0;");
@@ -973,16 +1035,15 @@ TaskGraphResult print_task_graph(
                           {"all_dependent_events", {}}};
   // generate task[0] (TASK_TERMINATE)
   {
+    FullTaskDesc const &term_task = all_tasks[0];
     tgbody.e("all_tasks.push_back(FullTaskDesc(TASK_TERMINATE));");
     json_task_graph["all_tasks"].push_back(
         json{{"task_type", TASK_TERMINATE},
              {"variant_id", 0},
              {"inputs", {}},
              {"outputs", {}},
-             {"trigger_events_start", 0},
-             {"trigger_events_count", 0},
-             {"dependent_events_start", 0},
-             {"dependent_events_count", 0},
+             {"trigger_event", term_task.trigger_event},
+             {"dependent_event", term_task.dependent_event},
              {"request_id", -1},
              {"expert_offset", -1},
              {"kv_idx", -1},
@@ -998,10 +1059,8 @@ TaskGraphResult print_task_graph(
              {"variant_id", 0},
              {"inputs", {}},
              {"outputs", {}},
-             {"trigger_events_start", begin_task.trigger_events_start},
-             {"trigger_events_count", begin_task.trigger_events_count},
-             {"dependent_events_start", begin_task.dependent_events_start},
-             {"dependent_events_count", begin_task.dependent_events_count},
+             {"trigger_event", begin_task.trigger_event},
+             {"dependent_event", begin_task.dependent_event},
              {"request_id", -1},
              {"expert_offset", -1},
              {"kv_idx", -1},
@@ -1060,15 +1119,15 @@ TaskGraphResult print_task_graph(
             tgbody.e("FullTaskDesc task_desc(static_cast<TaskType>($));",
                      task_desc.task_type);
             json json_task;
+            // Serialize the full union value as trigger_event/dependent_event
+            // (raw 8-byte EventId covers both direct and indirect views)
             json_task = {
                 {"task_type", task_desc.task_type},
                 {"variant_id", task_desc.variant_id},
                 {"inputs", {}},
                 {"outputs", {}},
-                {"trigger_events_start", task_desc.trigger_events_start},
-                {"trigger_events_count", task_desc.trigger_events_count},
-                {"dependent_events_start", task_desc.dependent_events_start},
-                {"dependent_events_count", task_desc.dependent_events_count},
+                {"trigger_event", task_desc.trigger_event},
+                {"dependent_event", task_desc.dependent_event},
                 {"request_id", task_desc.task_metadata.request_id},
                 {"expert_offset", task_desc.task_metadata.expert_offset},
                 {"kv_idx", task_desc.task_metadata.kv_idx},
@@ -1491,6 +1550,10 @@ TaskGraphResult Graph::generate_task_graph(int _num_gpus, int _my_gpu_id) {
   EventDesc e(EVENT_TERMINATION, 1, 0, 0);
   all_events.push_back(e);
   FullTaskDesc t(TASK_TERMINATE, 0 /*variant_id*/);
+  // TASK_TERMINATE must have trigger/dependent = 0 (no events),
+  // because the worker processes dependent_event BEFORE checking task type.
+  t.trigger_event = 0;
+  t.dependent_event = 0;
   all_tasks.push_back(t);
   register_mugraph(*this,
                    num_gpus,

@@ -71,7 +71,11 @@ typedef unsigned long long int EventId;
 // Event IDs are 64-bit values encoding both the owner of the event and its
 // index EVENT: nvshmem_tag: 16, owner_node: 16, event_idx: 32
 unsigned long long int const EVENT_NVSHMEM_TAG = 0x1e00000000000000;
-unsigned long long int const EVENT_INVALID_ID = 0x7ffffffffffffffe;
+// Bit 63 flag: set in the union's _trigger_pad / _dep_pad field to indicate
+// N-way (multi-event) mode. Bit 63 is always 0 for valid EventIds, so this
+// cleanly discriminates 1-way (direct EventId) from N-way (flat array index).
+// Convention: EventId == 0 means "no event" (replaces the old EVENT_INVALID_ID).
+unsigned long long int const EVENT_MULTI_FLAG = 1ULL << 63;
 typedef unsigned long long int EventCounter;
 
 int const MAX_INPUTS_PER_TASK = 7;
@@ -192,31 +196,47 @@ struct EventDesc {
 
 struct FullTaskDesc {
   FullTaskDesc(TaskType t, int _variant_id)
-      : task_type(t), variant_id(_variant_id), num_inputs(0), num_outputs(0),
-        trigger_events_start(0), trigger_events_count(0), _trigger_pad(0),
-        dependent_events_start(0), dependent_events_count(0), _dep_pad(0) {
+      : task_type(t), variant_id(_variant_id), num_inputs(0), num_outputs(0) {
+    // Initialize union fields to 0 (safe: count=0 means 1-way fast path,
+    // and event_id=0 means "no event" for the dependent side).
+    trigger_event = 0;
+    dependent_event = 0;
     task_metadata.raw_payload = ~0ull;
   }
   FullTaskDesc() {
+    trigger_event = 0;
+    dependent_event = 0;
     task_metadata.raw_payload = ~0ull;
   }
   TaskType task_type;
   unsigned variant_id;
   int num_inputs, num_outputs;
-  // Trigger events: fan-out support (flat array indirection)
-  // For 1-way tasks: count=1, start indexes single entry in flat array
-  // For N-way fork: count=N, start indexes N contiguous entries
-  // For tasks with no trigger (TASK_TERMINATE): count=0
-  uint32_t trigger_events_start;  // index into RuntimeConfig::all_trigger_events
-  uint16_t trigger_events_count;  // number of trigger events
-  uint16_t _trigger_pad;
-  // Dependent events: fan-in support (flat array indirection)
-  // For 1-way tasks: count=1, start indexes single entry in flat array
-  // For N-way join: count=N, start indexes N contiguous entries
-  // For tasks with no dependency (root tasks): count=0
-  uint32_t dependent_events_start;  // index into RuntimeConfig::all_dependent_events
-  uint16_t dependent_events_count;  // number of dependent events
-  uint16_t _dep_pad;
+  // Trigger event(s) — anonymous union shares 8 bytes.
+  // 1-way single-GPU tasks (the common case): use trigger_event directly.
+  //   Discriminator: trigger_events_count == 0 (gpu_id=0 in upper bytes).
+  // N-way fork or multi-GPU tasks: use {trigger_events_start, trigger_events_count}
+  //   to index into RuntimeConfig::all_trigger_events flat array.
+  union {
+    EventId trigger_event;
+    struct {
+      uint32_t trigger_events_start;
+      uint16_t trigger_events_count;
+      uint16_t _trigger_pad;
+    };
+  };
+  // Dependent event(s) — same union pattern.
+  // 1-way single-GPU tasks: use dependent_event directly.
+  //   Discriminator: dependent_events_count == 0.
+  // N-way join or multi-GPU tasks: use {dependent_events_start, dependent_events_count}.
+  // No dependency: set entire union to 0 (count=0, start=0).
+  union {
+    EventId dependent_event;
+    struct {
+      uint32_t dependent_events_start;
+      uint16_t dependent_events_count;
+      uint16_t _dep_pad;
+    };
+  };
   TensorDesc inputs[MAX_INPUTS_PER_TASK];
   TensorDesc outputs[MAX_OUTPUTS_PER_TASK];
   union TaskMetadata {
@@ -242,13 +262,9 @@ static_assert(
 struct alignas(16) TaskDesc {
   TaskDesc(FullTaskDesc t)
       : task_type(t.task_type), variant_id(t.variant_id),
-        trigger_events_start(t.trigger_events_start),
-        trigger_events_count(t.trigger_events_count),
-        _trigger_pad(t._trigger_pad),
-        dependent_events_start(t.dependent_events_start),
-        dependent_events_count(t.dependent_events_count),
-        _dep_pad(t._dep_pad),
         task_metadata(t.task_metadata) {
+    trigger_event = t.trigger_event;
+    dependent_event = t.dependent_event;
     for (int i = 0; i < t.num_inputs; i++) {
       input_ptrs[i] = t.inputs[i].base_ptr;
     }
@@ -273,14 +289,23 @@ struct alignas(16) TaskDesc {
   }
   TaskType task_type;
   unsigned variant_id;
-  // Trigger events (flat array indirection, same 8 bytes as old EventId)
-  uint32_t trigger_events_start;
-  uint16_t trigger_events_count;
-  uint16_t _trigger_pad;
-  // Dependent events (flat array indirection, same 8 bytes as old EventId)
-  uint32_t dependent_events_start;
-  uint16_t dependent_events_count;
-  uint16_t _dep_pad;
+  // Same union layout as FullTaskDesc
+  union {
+    EventId trigger_event;
+    struct {
+      uint32_t trigger_events_start;
+      uint16_t trigger_events_count;
+      uint16_t _trigger_pad;
+    };
+  };
+  union {
+    EventId dependent_event;
+    struct {
+      uint32_t dependent_events_start;
+      uint16_t dependent_events_count;
+      uint16_t _dep_pad;
+    };
+  };
   void *input_ptrs[MAX_INPUTS_PER_TASK];
   void *output_ptrs[MAX_OUTPUTS_PER_TASK];
 #ifdef MPK_ENABLE_TMA
