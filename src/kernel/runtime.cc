@@ -437,6 +437,14 @@ void register_mugraph(
               task.task_metadata.kv_idx = bid.y;
               task.task_metadata.merge_task_offset = bid.z;
             }
+            // Unified MLA grid:
+            //   prefill interprets (x,y,z) as (head, q_block, batch)
+            //   decode interprets (x,y,z) as (packed_decode_block, batch, 0)
+            if (task_type == TASK_MLA_UNIFIED_SM100) {
+              task.task_metadata.kv_idx = bid.x;
+              task.task_metadata.request_id = bid.y;
+              task.task_metadata.merge_task_offset = bid.z;
+            }
             // MTP decode: grid=(sk, num_head_groups, B)
             // request_id=gi (head_group from bid.y), kv_idx=si (split from
             // bid.x) expert_offset stores hpb for TMA box dimension
@@ -756,7 +764,8 @@ TaskGraphResult print_task_graph(
            "task.at(\"task_type\") == TASK_MLA_MTP_DECODE_TP2_SM100 || "
            "task.at(\"task_type\") == TASK_MLA_MTP_DECODE_TP4_SM100 || "
            "task.at(\"task_type\") == TASK_MLA_MTP_DECODE_TP8_SM100 || "
-           "task.at(\"task_type\") == TASK_MLA_PREFILL_TP8_SM100) {");
+           "task.at(\"task_type\") == TASK_MLA_PREFILL_TP8_SM100 || "
+           "task.at(\"task_type\") == TASK_MLA_UNIFIED_SM100) {");
     code.e("create_tma_desc_by_task(task_desc);");
     code.e("}");
     // FP8 linear tasks need TMA (outside SM100_TMA range)
@@ -1327,6 +1336,7 @@ TaskGraphResult print_task_graph(
   task_type_to_name[TASK_MLA_REDUCE_SM100] = "TASK_MLA_REDUCE_SM100";
   task_type_to_name[TASK_MLA_PREFILL_SM100] = "TASK_MLA_PREFILL_SM100";
   task_type_to_name[TASK_MLA_PREFILL_TP8_SM100] = "TASK_MLA_PREFILL_TP8_SM100";
+  task_type_to_name[TASK_MLA_UNIFIED_SM100] = "TASK_MLA_UNIFIED_SM100";
   task_type_to_name[TASK_MLA_MTP_DECODE_SM100] = "TASK_MLA_MTP_DECODE_SM100";
   task_type_to_name[TASK_MLA_MTP_REDUCE_SM100] = "TASK_MLA_MTP_REDUCE_SM100";
   task_type_to_name[TASK_MLA_MTP_DECODE_TP2_SM100] =
