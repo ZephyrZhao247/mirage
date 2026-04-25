@@ -1092,8 +1092,14 @@ class PersistentKernel:
         d_v: int = 512,
     ):
         num_splits = (kv_len + 128 - 1) // 128
+        # The graph may be compiled for a large chunk-prefill Q length (e.g.
+        # 128), but the decode branch only handles Q_LEN <= 8. Size the
+        # decode half of the unified grid for that real decode domain instead
+        # of the prefill chunk size; otherwise prefill iterations enqueue many
+        # no-op decode CTAs.
+        decode_q_len = min(q_len, 8)
         if tp_size == 1:
-            hpb = num_heads // q_len
+            hpb = num_heads // decode_q_len
             if hpb < 1:
                 hpb = 1
             while num_heads % hpb != 0:
@@ -1101,15 +1107,15 @@ class PersistentKernel:
             num_groups = num_heads // hpb
             x_mul = 1
         elif tp_size == 2:
-            qpg = min(2, q_len)
-            num_groups = (q_len + qpg - 1) // qpg
+            qpg = min(2, decode_q_len)
+            num_groups = (decode_q_len + qpg - 1) // qpg
             x_mul = 1
         elif tp_size == 4:
-            qpg = min(4, q_len)
-            num_groups = (q_len + qpg - 1) // qpg
+            qpg = min(4, decode_q_len)
+            num_groups = (decode_q_len + qpg - 1) // qpg
             x_mul = 2
         elif tp_size == 8:
-            q_len_padded = (q_len + 1) & ~1
+            q_len_padded = (decode_q_len + 1) & ~1
             qpg = 2
             num_groups = (q_len_padded + qpg - 1) // qpg
             x_mul = 1
@@ -1124,7 +1130,7 @@ class PersistentKernel:
             self.max_num_batched_requests,
         )
         block_dim = (256, 1, 1)
-        params = [num_heads, q_len, kv_len, num_splits,
+        params = [num_heads, decode_q_len, kv_len, num_splits,
                   tp_size, d_ckv, d_kpe, d_v]
 
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))

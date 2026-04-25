@@ -234,11 +234,11 @@ class DeepSeekV3Builder(GraphBuilder):
 
         # Pick the MLA kernel at compile time based on max_num_batched_tokens.
         # Large Q_LEN uses the mla_prefill_sm100 chunked-prefill kernel (which
-        # is designed for that regime); small Q_LEN uses the MLA decode / MTP
-        # decode kernels. The threshold of 32 is chosen so MTP decode
-        # (spec_length ≤ 7) always goes through the decode path, and any
-        # realistic chunked-prefill chunk size (≥ 128 typically) goes through
-        # prefill. The MPK scheduler still dynamically caps per-iter
+        # is designed for that regime); runtime Q_LEN <= 8 uses the MLA decode
+        # / MTP decode kernels. The compile-time threshold of 32 keeps MTP
+        # decode graphs on the decode path, while chunked-prefill tails with
+        # runtime Q_LEN > 8 still go through prefill. The MPK scheduler still
+        # dynamically caps per-iter
         # num_new_tokens via paged_kv_indptr — prefill phase uses chunk=mbt,
         # decode phase uses chunk=1 — so a single compiled graph handles both
         # phases correctly at the same mbt budget.
@@ -690,6 +690,7 @@ class DeepSeekV3Builder(GraphBuilder):
             torch_tensor=self.ckv_kpe_cache[layer_idx],
             name=f"layer_{layer_idx}_kv_cache")
         q_len_mla = self.max_num_batched_tokens
+        decode_q_len_mla = min(q_len_mla, 8)
         kv_len_max = self.mpk.max_seq_length
         if self._use_prefill:
             self.mpk.mla_kv_gather_split_layer(
@@ -724,19 +725,19 @@ class DeepSeekV3Builder(GraphBuilder):
             if self.world_size == 2:
                 self.mpk.mla_mtp_decode_tp2_reduce_layer(
                     self.mla_partial_o, self.mla_partial_lse,
-                    self.attn_out, q_len_mla, kv_len_max)
+                    self.attn_out, decode_q_len_mla, kv_len_max)
             elif self.world_size == 4:
                 self.mpk.mla_mtp_decode_tp4_reduce_layer(
                     self.mla_partial_o, self.mla_partial_lse,
-                    self.attn_out, q_len_mla, kv_len_max)
+                    self.attn_out, decode_q_len_mla, kv_len_max)
             elif self.world_size == 8:
                 self.mpk.mla_mtp_decode_tp8_reduce_layer(
                     self.mla_partial_o, self.mla_partial_lse,
-                    self.attn_out, q_len_mla, kv_len_max)
+                    self.attn_out, decode_q_len_mla, kv_len_max)
             else:
                 self.mpk.mla_mtp_reduce_layer(
                     self.mla_partial_o, self.mla_partial_lse,
-                    self.attn_out, q_len_mla, kv_len_max)
+                    self.attn_out, decode_q_len_mla, kv_len_max)
         else:
             if self.world_size == 2:
                 self.mpk.mla_mtp_decode_tp2_layer(
@@ -1339,6 +1340,7 @@ class DeepSeekV3Builder(GraphBuilder):
         # enabled, one unified MLA main task chooses prefill vs decode from
         # runtime Q_LEN.
         q_len_mla = self.max_num_batched_tokens
+        decode_q_len_mla = min(q_len_mla, 8)
         kv_len_max = self.mpk.max_seq_length
         if self._use_prefill:
             self.mpk.mla_kv_gather_split_layer(
@@ -1372,19 +1374,19 @@ class DeepSeekV3Builder(GraphBuilder):
             if self.world_size == 2:
                 self.mpk.mla_mtp_decode_tp2_reduce_layer(
                     self.mla_partial_o, self.mla_partial_lse,
-                    self.attn_out, q_len_mla, kv_len_max)
+                    self.attn_out, decode_q_len_mla, kv_len_max)
             elif self.world_size == 4:
                 self.mpk.mla_mtp_decode_tp4_reduce_layer(
                     self.mla_partial_o, self.mla_partial_lse,
-                    self.attn_out, q_len_mla, kv_len_max)
+                    self.attn_out, decode_q_len_mla, kv_len_max)
             elif self.world_size == 8:
                 self.mpk.mla_mtp_decode_tp8_reduce_layer(
                     self.mla_partial_o, self.mla_partial_lse,
-                    self.attn_out, q_len_mla, kv_len_max)
+                    self.attn_out, decode_q_len_mla, kv_len_max)
             else:
                 self.mpk.mla_mtp_reduce_layer(
                     self.mla_partial_o, self.mla_partial_lse,
-                    self.attn_out, q_len_mla, kv_len_max)
+                    self.attn_out, decode_q_len_mla, kv_len_max)
         else:
             if self.world_size == 2:
                 self.mpk.mla_mtp_decode_tp2_layer(

@@ -7,7 +7,7 @@
 namespace kernel {
 namespace mla_unified_sm100 {
 
-static constexpr int kPrefillMinQLen = 16;
+static constexpr int kPrefillMinQLen = 9;
 static constexpr int kDecodeMaxQLen = 8;
 
 template <bool SINGLE_TILE, int TP_SIZE>
