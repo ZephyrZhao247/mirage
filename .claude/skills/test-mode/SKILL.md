@@ -7,6 +7,23 @@ description: Guide for using MPK test mode to unit-test individual layers or mul
 
 Test mode compiles and runs an MPK task graph **exactly once**, without meta-tensors, batching, or persistent-loop iteration. It exercises the full pipeline — Python layer API, task registration, C++ code generation, nvcc compilation, and runtime dispatch — making it the primary tool for validating that a new layer or task works correctly end-to-end.
 
+## Required: PyTorch Reference Comparison
+
+**Every test mode file must include a PyTorch reference implementation** that computes the same operation, and must compare the MPK output against it numerically. A test that only runs the kernel without checking correctness is not a valid test — it only proves the kernel doesn't crash.
+
+The reference should:
+- Use plain `torch` ops (or `torch.nn.functional`) to implement the same math the layer performs.
+- Run on the same input tensors as the MPK kernel (cast to a higher precision like `float32` if needed for a trustworthy reference).
+- Be compared with a tolerance appropriate to the dtype: bf16 typically `atol=1e-2, rtol=1e-2`; fp16 similar; fp32 much tighter.
+
+Use `torch.testing.assert_close(out, ref, atol=..., rtol=...)` and/or print `(out - ref).abs().max()` so failures surface immediately rather than silently producing wrong numbers.
+
+### Where the reference lives: `pytorch_reference.py`
+
+Per-layer test_mode files **must import their PyTorch reference from `pytorch_reference.py` in the same folder**, not redefine it inline. The folder layout is `tests/runtime_python/<arch>/sm100_<layer>/`, with one `pytorch_reference.py` per folder containing one function per in-scope layer. Both the new test_mode test (`test_<layer>_testmode.py`) and the existing kernel-wrapper test (`test_<layer>.py`) import from the same file, so they stay aligned on a single canonical reference.
+
+If `pytorch_reference.py` does not yet exist for the layer, create it. If a kernel-wrapper test already exists with an inline reference, extract that reference into `pytorch_reference.py` and refactor the kernel-wrapper test to import from it.
+
 ## Quick Start
 
 ```python
@@ -41,9 +58,15 @@ pk.compile(output_dir="./test_output")   # saves .cu and .json for debugging
 pk.run_test_mode()
 torch.cuda.synchronize()
 
-# 5. Compare — `out` tensor is now modified in-place
+# 5. Compare against a PyTorch reference
+def torch_rmsnorm(x, w, eps=1e-6):
+    x_f32 = x.to(torch.float32)
+    rms = x_f32.pow(2).mean(dim=-1, keepdim=True).add(eps).rsqrt()
+    return (x_f32 * rms * w.to(torch.float32)).to(x.dtype)
+
 ref = torch_rmsnorm(x, w)
 print("Max diff:", (out - ref).abs().max().item())
+torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 # 6. Cleanup
 pk.finalize()
