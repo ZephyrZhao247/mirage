@@ -20,10 +20,16 @@ template <typename T,
           int BATCH_SIZE,
           int OUTPUT_SIZE,
           int I_STRIDE,
-          int O_STRIDE>
+          int O_STRIDE,
+          bool WITH_CLAMP = false>
 __device__ __forceinline__ void silu_mul_task_impl(void const *input_ptr,
                                                    void *output_ptr,
-                                                   int num_active_tokens) {
+                                                   int num_active_tokens,
+                                                   float swiglu_limit = 0.0f) {
+  // V4-Flash clamped SwiGLU: when WITH_CLAMP=true, the gate is clamped to
+  // (-inf, L] (max-only, asymmetric) and the up is clamped to [-L, L] (full)
+  // before silu(gate) * up. See model.py:596-606 in DeepSeek-V4-Flash.
+  // When WITH_CLAMP=false the kernel is byte-identical to the V3 path.
   T const *__restrict__ d_input = static_cast<T const *>(input_ptr);
   T const *__restrict__ d_mul = static_cast<T const *>(input_ptr) + OUTPUT_SIZE;
   T *__restrict__ d_output = static_cast<T *>(output_ptr);
@@ -34,9 +40,19 @@ __device__ __forceinline__ void silu_mul_task_impl(void const *input_ptr,
     int batch_idx = i / OUTPUT_SIZE;
     int offset = i % OUTPUT_SIZE;
     float input_val = float(d_input[batch_idx * I_STRIDE + offset]);
-    T mul_val = d_mul[batch_idx * I_STRIDE + offset];
-    d_output[batch_idx * O_STRIDE + offset] =
-        T(input_val / (1.0f + expf(-input_val))) * mul_val;
+    if (WITH_CLAMP) {
+      // gate: asymmetric upper clamp only (model.py:602)
+      input_val = fminf(input_val, swiglu_limit);
+      float mul_val = float(d_mul[batch_idx * I_STRIDE + offset]);
+      // up: full clamp to [-L, L] (model.py:601)
+      mul_val = fminf(fmaxf(mul_val, -swiglu_limit), swiglu_limit);
+      d_output[batch_idx * O_STRIDE + offset] =
+          T(input_val / (1.0f + expf(-input_val))) * T(mul_val);
+    } else {
+      T mul_val = d_mul[batch_idx * I_STRIDE + offset];
+      d_output[batch_idx * O_STRIDE + offset] =
+          T(input_val / (1.0f + expf(-input_val))) * mul_val;
+    }
   }
 }
 

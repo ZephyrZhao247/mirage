@@ -360,7 +360,15 @@ int TaskRegister::register_single_batch_extend_attention_task(
 
 int TaskRegister::register_silu_mul_task(threadblock::Graph const &bgraph,
                                          std::vector<int> const &params) {
-  assert(params.size() == 0);
+  // params is either empty (legacy V3, no clamp) or
+  // [with_clamp_flag (0/1), L_bits (float bit-pattern)] (V4-Flash clamped).
+  assert(params.size() == 0 || params.size() == 2);
+  bool with_clamp = false;
+  float swiglu_limit = 0.0f;
+  if (params.size() == 2) {
+    with_clamp = params[0] != 0;
+    memcpy(&swiglu_limit, &params[1], sizeof(float));
+  }
   int batch_size = 0, output_size = 0, input_stride, output_stride;
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
@@ -392,14 +400,16 @@ int TaskRegister::register_silu_mul_task(threadblock::Graph const &bgraph,
   output_stride = static_cast<int>(kn_input_op->input_strides[0]);
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  code.e("kernel::silu_mul_task_impl<bfloat16, $, $, $, $>(",
+  code.e("kernel::silu_mul_task_impl<bfloat16, $, $, $, $, $>(",
          batch_size,
          output_size,
          input_stride,
-         output_stride);
+         output_stride,
+         with_clamp ? "true" : "false");
   code.e("    task_desc->input_ptrs[0],");
   code.e("    task_desc->output_ptrs[0],");
-  code.e("    runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS]);");
+  code.e("    runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS],");
+  code.e("    $f);", swiglu_limit);
   return register_task_variant(TASK_SILU_MUL, code.to_string());
 }
 
