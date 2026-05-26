@@ -47,16 +47,45 @@ class SiluMul(MPKModule):
     bf16. The kernel partitions on dim 1 (the output / intermediate axis);
     ``intermediate_size`` must be divisible by ``grid.x``. SiLU computed in
     fp32 internally.
+
+    When ``swiglu_limit`` is a positive float (V4-Flash clamped SwiGLU,
+    e.g. ``10.0``), gate is asymmetrically upper-clamped to ``max=L`` and up
+    is symmetrically clamped to ``[-L, L]`` before the silu*mul. Default
+    ``None`` is the V3 behavior — byte-identical, no perf hit (selected via
+    a ``WITH_CLAMP=false`` template instantiation).
     """
 
-    def __init__(self, intermediate_size: int, *, prefix: str = "") -> None:
+    def __init__(
+        self,
+        intermediate_size: int,
+        *,
+        swiglu_limit: Optional[float] = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__(prefix=prefix)
         self.intermediate_size = intermediate_size
+        if swiglu_limit is not None and swiglu_limit <= 0.0:
+            raise ValueError(
+                f"swiglu_limit must be a positive float or None; got {swiglu_limit}"
+            )
+        self.swiglu_limit = swiglu_limit
 
     def forward(self, gateup: torch.Tensor) -> torch.Tensor:
-        """``F.silu(gate) * up`` on halved layout (fp32 internally)."""
+        """``F.silu(gate) * up`` on halved layout (fp32 internally).
+
+        With ``self.swiglu_limit`` set, mirrors V4-Flash ``Expert.forward``:
+        ``gate = clamp(gate, max=L)``, ``up = clamp(up, -L, L)``, then
+        ``silu(gate) * up``. The PyTorch reference exactly matches what the
+        kernel computes (same per-element clamp; both promote to fp32).
+        """
         gate, up = _split_gate_up_halved(gateup, self.intermediate_size)
-        return (F.silu(gate.float()) * up.float()).to(gateup.dtype)
+        gate_f = gate.float()
+        up_f = up.float()
+        if self.swiglu_limit is not None:
+            L = float(self.swiglu_limit)
+            gate_f = torch.clamp(gate_f, max=L)
+            up_f = torch.clamp(up_f, min=-L, max=L)
+        return (F.silu(gate_f) * up_f).to(gateup.dtype)
 
     def auto_grid_dim(self, gateup_dt) -> GridDim:
         """Stripe over the M*N output: largest divisor of
@@ -133,7 +162,17 @@ class SiluMul(MPKModule):
         tb_graph.new_input(gateup, (1, -1, -1), 1, True)
         tb_graph.new_input(out_dt, (1, -1, -1), 1, True)
         pk.kn_graph.customized([gateup, out_dt], tb_graph)
-        pk.kn_graph.register_task(tb_graph, "silu_mul")
+        # Encode swiglu_limit as [with_clamp_flag, L_bits] when set.
+        # Empty params preserves V3 byte-for-byte (codegen emits
+        # WITH_CLAMP=false template). See task_register.cc:
+        # register_silu_mul_task for the decode.
+        if self.swiglu_limit is None:
+            params = []
+        else:
+            import struct
+            L_bits = struct.unpack("i", struct.pack("f", float(self.swiglu_limit)))[0]
+            params = [1, L_bits]
+        pk.kn_graph.register_task(tb_graph, "silu_mul", params)
         return out_dt
 
 
