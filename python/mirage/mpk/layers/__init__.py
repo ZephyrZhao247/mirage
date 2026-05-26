@@ -118,6 +118,14 @@ from .moe import (
     MoEUnpermute,
 )
 
+# HC (Hyper-Connections — DeepSeek V4-Flash)
+from .hc import (
+    MhcPrenormGemm,
+    MhcPre,
+    MhcPost,
+    MhcHead,
+)
+
 # MTP / speculative-decode (DeepSeek V3 MTP path + prompt-lookup spec-decode)
 from .mtp import (
     MTPTokenScatter,
@@ -223,6 +231,11 @@ __all__ = [
     "MoeMulSumAdd",
     "MoEPermute",
     "MoEUnpermute",
+    # HC (Hyper-Connections)
+    "MhcPrenormGemm",
+    "MhcPre",
+    "MhcPost",
+    "MhcHead",
     # MTP / speculative-decode
     "MTPTokenScatter",
     "MTPFloatScatter",
