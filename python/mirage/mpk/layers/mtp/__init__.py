@@ -33,6 +33,7 @@ from .verify import (
     MTPAcceptCommit,
 )
 from .find_ngram import FindNgramPartial, FindNgramGlobal
+from .embed_hidden_fuse import MTPEmbedHiddenFuse
 
 __all__ = [
     "MTPTokenScatter",
@@ -48,4 +49,5 @@ __all__ = [
     "MTPAcceptCommit",
     "FindNgramPartial",
     "FindNgramGlobal",
+    "MTPEmbedHiddenFuse",
 ]

@@ -142,6 +142,7 @@ from .mtp import (
     MTPAcceptCommit,
     FindNgramPartial,
     FindNgramGlobal,
+    MTPEmbedHiddenFuse,
 )
 
 __all__ = [
@@ -252,4 +253,5 @@ __all__ = [
     "MTPAcceptCommit",
     "FindNgramPartial",
     "FindNgramGlobal",
+    "MTPEmbedHiddenFuse",
 ]
