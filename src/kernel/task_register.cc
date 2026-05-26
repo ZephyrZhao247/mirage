@@ -4945,6 +4945,96 @@ int TaskRegister::register_mhc_pre_sm100_task(
   return register_task_variant(TASK_MHC_PRE_SM100, code.to_string());
 }
 
+int TaskRegister::register_mla_v4_q_kv_rmsnorm_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // DeepSeek V4-Flash pre-attention joint Q-lora + KV-lora RMSNorm.
+  //
+  // Inputs:
+  //   q_in       [num_tokens_total, Q_SIZE]  bf16  (split on dim 0)
+  //   kv_in      [num_tokens_total, KV_SIZE] bf16  (split on dim 0)
+  //   q_weight   [Q_SIZE]                    bf16  (broadcast)
+  //   kv_weight  [KV_SIZE]                   bf16  (broadcast)
+  // Outputs:
+  //   q_out      [num_tokens_total, Q_SIZE]  bf16
+  //   kv_out     [num_tokens_total, KV_SIZE] bf16
+  //
+  // ``Q_SIZE`` and ``KV_SIZE`` are read from the trailing dim of q_in /
+  // kv_in respectively. The single ``param`` (optional) is ``eps * 1e8``
+  // as an integer; if no param is supplied we default to 1e-6f. The
+  // integer encoding is used because ``register_task`` only accepts
+  // ``std::vector<int>`` params.
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int const num_inputs = 4;
+  int const num_outputs = 2;
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  // q_in: [num_tokens_total, Q_SIZE]
+  assert(input_ops[0]->dtensor.num_dims == 2);
+  int num_tokens_total = input_ops[0]->dtensor.dim[0];
+  int q_size = input_ops[0]->dtensor.dim[1];
+  // kv_in: [num_tokens_total, KV_SIZE]
+  assert(input_ops[1]->dtensor.num_dims == 2);
+  assert(input_ops[1]->dtensor.dim[0] == num_tokens_total);
+  int kv_size = input_ops[1]->dtensor.dim[1];
+  // q_weight: [Q_SIZE]
+  assert(input_ops[2]->dtensor.num_dims == 1);
+  assert(input_ops[2]->dtensor.dim[0] == q_size);
+  // kv_weight: [KV_SIZE]
+  assert(input_ops[3]->dtensor.num_dims == 1);
+  assert(input_ops[3]->dtensor.dim[0] == kv_size);
+  // q_out: same shape as q_in
+  assert(output_ops[0]->dtensor.num_dims == 2);
+  assert(output_ops[0]->dtensor.dim[0] == num_tokens_total);
+  assert(output_ops[0]->dtensor.dim[1] == q_size);
+  // kv_out: same shape as kv_in
+  assert(output_ops[1]->dtensor.num_dims == 2);
+  assert(output_ops[1]->dtensor.dim[0] == num_tokens_total);
+  assert(output_ops[1]->dtensor.dim[1] == kv_size);
+
+  // Pick NUM_THREADS that divides both row widths. 128 covers V4-Flash
+  // (1024 % 128 == 0, 512 % 128 == 0). Fall back to 64/32 if the user
+  // gives an unusually small width (debugging / test only).
+  int num_threads = 128;
+  if (q_size % num_threads != 0 || kv_size % num_threads != 0) {
+    num_threads = 64;
+  }
+  if (q_size % num_threads != 0 || kv_size % num_threads != 0) {
+    num_threads = 32;
+  }
+  assert(q_size % num_threads == 0);
+  assert(kv_size % num_threads == 0);
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::mla_v4_q_kv_rmsnorm_task_impl<$, $, $>(",
+         q_size,
+         kv_size,
+         num_threads);
+  code.e("    task_desc->input_ptrs[0],");   // q_in
+  code.e("    task_desc->input_ptrs[1],");   // kv_in
+  code.e("    task_desc->input_ptrs[2],");   // q_weight
+  code.e("    task_desc->input_ptrs[3],");   // kv_weight
+  code.e("    task_desc->output_ptrs[0],");  // q_out
+  code.e("    task_desc->output_ptrs[1],");  // kv_out
+  code.e("    task_desc->task_metadata.token_offset,");
+  code.e("    1,"); // num_tokens_per_task = 1 (v1: one CTA per token)
+  code.e("    $,", num_tokens_total);
+  code.e("    1e-6f);"); // eps — matches V3 rmsnorm hardwire
+  // Suppress unused-params warning if the caller passed eps as a hint
+  // (we ignore it in v1).
+  (void)params;
+  return register_task_variant(TASK_MLA_V4_Q_KV_RMSNORM_SM100,
+                               code.to_string());
+}
+
 int TaskRegister::register_hash_route_lookup_sm100_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
   // V4-Flash hash routing for early MoE layers.
