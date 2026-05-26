@@ -661,6 +661,11 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(2, 1, TASK_ELEMENTWISE_ADD_SM100, variant_id);
+  } else if (name == "mhc_head_sm100") {
+    int variant_id = task_register->register_mhc_head_sm100_task(
+        customized->bgraph, params);
+    // 4 inputs (residual, fn, hc_scale, hc_base), 1 output
+    task_config[op] = std::make_tuple(4, 1, TASK_MHC_HEAD_SM100, variant_id);
   } else if (name == "softmax_gather_sm100") {
     int variant_id = task_register->register_softmax_gather_sm100_task(
         customized->bgraph, params);

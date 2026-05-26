@@ -2145,6 +2145,49 @@ int TaskRegister::register_elementwise_add_sm100_task(
   return register_task_variant(TASK_ELEMENTWISE_ADD_SM100, code.to_string());
 }
 
+int TaskRegister::register_mhc_head_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0] = HC (defaults to 4 if absent)
+  int hc = params.size() > 0 ? params[0] : 4;
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 4;  // residual, fn, hc_scale, hc_base
+  int num_outputs = 1; // out
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  // residual shape: [N, hc, H] (3-D) — per-task slice is [batch_size, hc, H].
+  // The TBGraph input partitions dim 0 (token batch), so each block sees
+  // batch_size = output_tensors[0].dim[0] tokens.
+  // Read residual hc/H from the DTensor (full shape) to be robust to per-block
+  // partition transformations applied to the STensor by the TBGraph.
+  int batch_size = input_ops[0]->output_tensors[0].dim[0];
+  int residual_hc = input_ops[0]->dtensor.dim[1];
+  int hidden_size = input_ops[0]->dtensor.dim[2];
+  (void)residual_hc;
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::mhc_head_task_impl<cute::bfloat16_t, $, $, $>(",
+         /*BATCH_SIZE=*/batch_size,
+         /*HC=*/hc,
+         /*H=*/hidden_size);
+  code.e("    task_desc->input_ptrs[0],"); // residual
+  code.e("    task_desc->input_ptrs[1],"); // fn
+  code.e("    task_desc->input_ptrs[2],"); // hc_scale
+  code.e("    task_desc->input_ptrs[3],"); // hc_base
+  code.e("    task_desc->output_ptrs[0],");
+  code.e("    1e-6f,");  // rms_eps
+  code.e("    1e-6f);"); // hc_eps
+  return register_task_variant(TASK_MHC_HEAD_SM100, code.to_string());
+}
+
 int TaskRegister::register_softmax_gather_sm100_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
   assert(params.size() == 0);

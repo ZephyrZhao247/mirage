@@ -36,6 +36,7 @@
 // sm100_ptx.cuh must be included BEFORE mla_mtp_decode_sm100.cuh at top level
 // so kernel::sm100_ptx is defined in the correct namespace
 #include "elementwise_add_sm100.cuh"
+#include "mhc_head_sm100.cuh"
 #include "mla_mtp_decode_sm100.cuh"
 #include "mla_mtp_decode_tp2_sm100.cuh"
 #include "mla_mtp_decode_tp4_sm100.cuh"
