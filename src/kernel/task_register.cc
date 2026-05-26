@@ -2145,6 +2145,87 @@ int TaskRegister::register_elementwise_add_sm100_task(
   return register_task_variant(TASK_ELEMENTWISE_ADD_SM100, code.to_string());
 }
 
+int TaskRegister::register_mhc_post_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: NUM_THREADS (defaults to 128 if absent)
+  assert(params.size() <= 1);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 4;
+  int num_outputs = 1;
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  // input_ops[0] = comb     [N, hc, hc]   fp32
+  // input_ops[1] = residual [N, hc, H]    bf16
+  // input_ops[2] = post     [N, hc]       fp32
+  // input_ops[3] = x        [N, H]        bf16
+  // output_ops[0] = out     [N, hc, H]    bf16
+  assert(output_ops[0]->dtensor.num_dims == 3);
+  int hc = output_ops[0]->dtensor.dim[1];
+  int H = output_ops[0]->dtensor.dim[2];
+  // Sanity: residual has same per-token shape as output.
+  assert(input_ops[1]->dtensor.num_dims == 3);
+  assert(input_ops[1]->dtensor.dim[1] == hc);
+  assert(input_ops[1]->dtensor.dim[2] == H);
+  // comb is [N, hc, hc]
+  assert(input_ops[0]->dtensor.num_dims == 3);
+  assert(input_ops[0]->dtensor.dim[1] == hc);
+  assert(input_ops[0]->dtensor.dim[2] == hc);
+  // post is [N, hc]
+  assert(input_ops[2]->dtensor.num_dims == 2);
+  assert(input_ops[2]->dtensor.dim[1] == hc);
+  // x is [N, H]
+  assert(input_ops[3]->dtensor.num_dims == 2);
+  assert(input_ops[3]->dtensor.dim[1] == H);
+
+  int num_threads = (params.size() == 1) ? params[0] : 128;
+  // Choose h_blk = gcd(H, 1024) to match TileLang's `mhc_post_tilelang`
+  // pipeline tiling. For H=4096 -> h_blk=1024 -> 4 tiles. For H<=1024 ->
+  // h_blk=H -> 1 tile.
+  auto gcd = [](int a, int b) {
+    while (b != 0) {
+      int t = b;
+      b = a % b;
+      a = t;
+    }
+    return a;
+  };
+  int h_blk = gcd(H, 1024);
+  // h_blk must be a multiple of num_threads for the per-thread tile loop.
+  // If not, fall back to the smallest factor of h_blk >= num_threads.
+  while (h_blk % num_threads != 0) {
+    // Shrink h_blk by halving until it becomes a multiple of num_threads.
+    // (For H=128, num_threads=128 -> h_blk=128 already works.)
+    if (h_blk < num_threads) {
+      h_blk = num_threads;
+      break;
+    }
+    h_blk /= 2;
+  }
+  assert(H % h_blk == 0);
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::mhc_post_task_impl<cute::bfloat16_t, $, $, $, $>(",
+         /*HC=*/hc,
+         /*H=*/H,
+         /*H_BLK=*/h_blk,
+         /*NUM_THREADS=*/num_threads);
+  code.e("    task_desc->input_ptrs[0],");
+  code.e("    task_desc->input_ptrs[1],");
+  code.e("    task_desc->input_ptrs[2],");
+  code.e("    task_desc->input_ptrs[3],");
+  code.e("    task_desc->output_ptrs[0]);");
+  return register_task_variant(TASK_MHC_POST_SM100, code.to_string());
+}
+
 int TaskRegister::register_softmax_gather_sm100_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
   assert(params.size() == 0);

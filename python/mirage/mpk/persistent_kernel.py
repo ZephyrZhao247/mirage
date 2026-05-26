@@ -2683,6 +2683,57 @@ class PersistentKernel:
         )
         self.kn_graph.register_task(tb_graph, "mhc_pre_sm100")
 
+    def mhc_post_layer(
+        self,
+        x: DTensor,
+        residual: DTensor,
+        post_mix: DTensor,
+        comb_mix: DTensor,
+        out: DTensor,
+        grid_dim: tuple,
+        block_dim: tuple = (128, 1, 1),
+    ):
+        """K5 HC post-expand step for DeepSeek V4-Flash.
+
+        Math (per token n):
+            out[n, hc_o, h] = post_mix[n, hc_o] * x[n, h]
+                + sum_{hc_i} comb_mix[n, hc_i, hc_o] * residual[n, hc_i, h]
+
+        Inputs:
+          x        : [N, H]      bf16  — attn/ffn block output
+          residual : [N, hc, H]  bf16  — pre-block HC stream snapshot
+          post_mix : [N, hc]     fp32  — from mhc_pre
+          comb_mix : [N, hc, hc] fp32  — from mhc_pre
+        Output:
+          out      : [N, hc, H]  bf16  — new HC stream residual
+
+        One CTA per token. ``grid_dim`` should be ``(N, 1, 1)``.
+        """
+        assert x.num_dims == 2          # (N, H)
+        assert residual.num_dims == 3   # (N, hc, H)
+        assert post_mix.num_dims == 2   # (N, hc)
+        assert comb_mix.num_dims == 3   # (N, hc, hc)
+        assert out.num_dims == 3        # (N, hc, H)
+        assert out.dim(0) == x.dim(0) == residual.dim(0) == post_mix.dim(0) == comb_mix.dim(0)
+        assert out.dim(1) == residual.dim(1) == post_mix.dim(1) == comb_mix.dim(1) == comb_mix.dim(2)
+        assert out.dim(2) == residual.dim(2) == x.dim(1)
+        # The codegen routes inputs/outputs in this order:
+        #   comb_mix, residual, post_mix, x, out
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(comb_mix, (0, -1, -1), -1, True)
+        tb_graph.new_input(residual, (0, -1, -1), -1, True)
+        tb_graph.new_input(post_mix, (0, -1, -1), -1, True)
+        tb_graph.new_input(x, (0, -1, -1), -1, True)
+        tb_graph.new_input(out, (0, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [comb_mix, residual, post_mix, x, out], tb_graph
+        )
+        # params[0] = num_threads (matches block_dim.x).
+        num_threads = block_dim[0]
+        self.kn_graph.register_task(
+            tb_graph, "mhc_post_sm100", [num_threads]
+        )
+
     def silu_mul_linear_with_residual_layer(
         self,
         input: DTensor,
