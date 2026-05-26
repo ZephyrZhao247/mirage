@@ -61,6 +61,15 @@ namespace kernel {
 
 static constexpr int WARP_SIZE_SIGMOID = 32;
 
+// Score function selector for topk_sigmoid_task_impl. Keep enum values
+// stable — they are also the integer encoding used in the host-side
+// `params` vector (params[3]).
+enum class ScoreFunc : int {
+  Sigmoid = 0,
+  SqrtSoftplus = 1,
+  Softmax = 2,
+};
+
 // Helper: merge two sorted-descending pairs (a1>=a2, b1>=b2) into top-2
 __device__ __forceinline__ void
     merge_top2(float &t1, float &t2, float o1, float o2) {
@@ -80,7 +89,8 @@ template <typename T,
           int NUM_GROUPS,
           int TOPK_GROUP,
           int EXPERTS_PER_GROUP,
-          int TOPK_EXPERTS>
+          int TOPK_EXPERTS,
+          ScoreFunc SCORE_FUNC = ScoreFunc::Sigmoid>
 __device__ __forceinline__ void topk_sigmoid_task_impl(
     void *__restrict__ input_ptr, // [num_rows, NUM_EXPERTS]
     void *__restrict__ bias_ptr,  // [NUM_EXPERTS] float
@@ -194,17 +204,70 @@ __device__ __forceinline__ void topk_sigmoid_task_impl(
 
     cutlass::NumericConverter<float, T> converter;
 
-    // Compute sigmoid and biased scores
-    float row_chunk[VPT];    // unbiased sigmoid scores (for final weights)
-    float biased_chunk[VPT]; // sigmoid + bias (for selection)
+    // Compute per-expert score and biased score.
+    // SCORE_FUNC == Sigmoid:      score = 1/(1+exp(-x))
+    // SCORE_FUNC == SqrtSoftplus: score = sqrt(log(1+exp(x)))  (V4-Flash)
+    // SCORE_FUNC == Softmax:      score = exp(x - row_max) / row_sum (per-row)
+    float row_chunk[VPT];    // unbiased per-expert scores (for final weights)
+    float biased_chunk[VPT]; // score + bias (for selection)
 
+    // For Softmax, we need the row-wise max and sum across all THREADS_PER_ROW
+    // lanes that participate in this row. We compute the logits first, then
+    // reduce.
+    float row_logits[VPT];
     int const bias_offset = thread_group_idx * VPT;
     for (int ii = 0; ii < VPT; ++ii) {
       float logit = converter(row_chunk_temp[ii]);
+      row_logits[ii] = logit;
       row_chunk_temp[ii] = static_cast<T>(0); // reset for split-k
-      float sig = 1.0f / (1.0f + expf(-logit));
-      row_chunk[ii] = sig;
-      biased_chunk[ii] = sig + bias[bias_offset + ii];
+    }
+
+    if constexpr (SCORE_FUNC == ScoreFunc::Sigmoid) {
+      for (int ii = 0; ii < VPT; ++ii) {
+        float sig = 1.0f / (1.0f + expf(-row_logits[ii]));
+        row_chunk[ii] = sig;
+        biased_chunk[ii] = sig + bias[bias_offset + ii];
+      }
+    } else if constexpr (SCORE_FUNC == ScoreFunc::SqrtSoftplus) {
+      for (int ii = 0; ii < VPT; ++ii) {
+        // softplus(x) = log(1 + exp(x)); use log1pf(expf(x)) for stability.
+        float sp = log1pf(expf(row_logits[ii]));
+        float sc = sqrtf(sp);
+        row_chunk[ii] = sc;
+        biased_chunk[ii] = sc + bias[bias_offset + ii];
+      }
+    } else { // Softmax
+      // Row-wise max across THREADS_PER_ROW lanes.
+      float local_max = row_logits[0];
+      for (int ii = 1; ii < VPT; ++ii) {
+        if (row_logits[ii] > local_max) {
+          local_max = row_logits[ii];
+        }
+      }
+      for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+        float other =
+            __shfl_xor_sync(warp_mask, local_max, mask, THREADS_PER_ROW);
+        if (other > local_max) {
+          local_max = other;
+        }
+      }
+      // exp(x - max), local sum.
+      float local_sum = 0.f;
+      for (int ii = 0; ii < VPT; ++ii) {
+        float e = expf(row_logits[ii] - local_max);
+        row_logits[ii] = e;
+        local_sum += e;
+      }
+      for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+        local_sum +=
+            __shfl_xor_sync(warp_mask, local_sum, mask, THREADS_PER_ROW);
+      }
+      float inv_row_sum = 1.0f / local_sum;
+      for (int ii = 0; ii < VPT; ++ii) {
+        float sc = row_logits[ii] * inv_row_sum;
+        row_chunk[ii] = sc;
+        biased_chunk[ii] = sc + bias[bias_offset + ii];
+      }
     }
 
     // Write back zeros (same as softmax kernel, for split-k gate linear)

@@ -157,13 +157,21 @@ class MoETopkSoftmaxRouting(_MoETopkRoutingBase):
         return moe_topk_weights, moe_routing_indices, moe_mask
 
 
+_SCORE_FUNC_ENUM = {"sigmoid": 0, "sqrtsoftplus": 1, "softmax": 2}
+
+
 class MoETopkSigmoidRouting(_MoETopkRoutingBase):
-    """Group-limited sigmoid top-k routing (DeepSeek V3).
+    """Group-limited bias-corrected top-k routing (DeepSeek V3 / V4-Flash).
 
     Owns the per-expert ``e_score_correction_bias`` as ``self.bias``
     (fp32, loaded from ``{prefix}bias``). The bias enters expert
     *selection* but NOT the returned weights, which are the renormalized
-    sigmoid scores scaled by ``routed_scaling_factor``.
+    per-expert scores scaled by ``routed_scaling_factor``.
+
+    ``score_func`` selects the elementwise/per-row scoring transform:
+      * ``"sigmoid"`` (default, DeepSeek V3): ``score = sigmoid(logit)``
+      * ``"sqrtsoftplus"`` (DeepSeek V4-Flash): ``score = sqrt(log(1+exp(logit)))``
+      * ``"softmax"`` (sanity): ``score = softmax(logits)`` per-row
     """
 
     def __init__(
@@ -177,6 +185,7 @@ class MoETopkSigmoidRouting(_MoETopkRoutingBase):
         local_num_experts: Optional[int] = None,
         local_expert_start: int = 0,
         hidden_size: Optional[int] = None,
+        score_func: str = "sigmoid",
         prefix: str = "",
     ) -> None:
         super().__init__(
@@ -192,15 +201,21 @@ class MoETopkSigmoidRouting(_MoETopkRoutingBase):
             local_num_experts if local_num_experts is not None else num_experts
         )
         self.local_expert_start = local_expert_start
+        if score_func not in _SCORE_FUNC_ENUM:
+            raise ValueError(
+                f"score_func must be one of {list(_SCORE_FUNC_ENUM)}; "
+                f"got {score_func!r}"
+            )
+        self.score_func = score_func
         # Per-expert score-correction bias (fp32 to match the kernel).
         self.bias = nn.Parameter(torch.zeros(num_experts, dtype=torch.float32))
 
     def forward(self, logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """DeepSeek V3 group-limited routing (5-step procedure).
+        """Group-limited routing with selectable scoring function.
 
-        Steps: sigmoid -> +bias -> per-group sum-top-2 -> keep top
+        Steps: score_func(logits) -> +bias -> per-group sum-top-2 -> keep top
         ``topk_group`` groups -> top-k by *biased* score among eligible
-        experts -> renormalize the *unbiased* sigmoid scores and scale.
+        experts -> renormalize the *unbiased* scores and scale.
         The reference assumes no TP (local_num_experts == num_experts).
         """
         if logits.dim() != 2 or logits.size(1) != self.num_experts:
@@ -211,7 +226,13 @@ class MoETopkSigmoidRouting(_MoETopkRoutingBase):
         batch_size = logits.size(0)
         device = logits.device
 
-        scores = torch.sigmoid(logits.float())
+        logits_f32 = logits.float()
+        if self.score_func == "sigmoid":
+            scores = torch.sigmoid(logits_f32)
+        elif self.score_func == "sqrtsoftplus":
+            scores = F.softplus(logits_f32).sqrt()
+        else:  # softmax
+            scores = F.softmax(logits_f32, dim=-1)
         biased = scores + self.bias.float()
         grouped = biased.view(batch_size, self.num_groups, -1)
         top2_per_group, _ = grouped.topk(2, dim=-1)
@@ -257,7 +278,8 @@ class MoETopkSigmoidRouting(_MoETopkRoutingBase):
           moe_mask: (local_num_experts + 1,) int32, prefix counts.
 
         Notes: TP-friendly — only experts in ``[local_expert_start, +local_num_experts)``
-        are written; params pack (num_groups, topk_group, scaling_bits, lo, hi).
+        are written; params pack (num_groups, topk_group, scaling_bits, lo, hi,
+        score_func) where score_func is 0=sigmoid, 1=sqrtsoftplus, 2=softmax.
         """
         import struct
         from ... import context as _ctx
@@ -289,6 +311,7 @@ class MoETopkSigmoidRouting(_MoETopkRoutingBase):
             scaling_bits,
             self.local_expert_start,
             self.local_expert_start + local_num_experts,
+            _SCORE_FUNC_ENUM[self.score_func],
         ]
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(logits, (0, -1, -1), -1, True)
@@ -314,6 +337,7 @@ def MoETopkRouting(
     routed_scaling_factor: float = 1.0,
     local_num_experts: Optional[int] = None,
     local_expert_start: int = 0,
+    score_func: str = "sigmoid",
     prefix: str = "",
 ):
     """Back-compat factory: dispatches to the softmax/sigmoid subclass.
@@ -343,6 +367,7 @@ def MoETopkRouting(
             routed_scaling_factor=routed_scaling_factor,
             local_num_experts=local_num_experts,
             local_expert_start=local_expert_start,
+            score_func=score_func,
             prefix=prefix,
         )
     raise ValueError(

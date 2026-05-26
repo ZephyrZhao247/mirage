@@ -2502,11 +2502,20 @@ int TaskRegister::register_moe_topk_softmax_sm100_task(
 
 int TaskRegister::register_moe_topk_sigmoid_sm100_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 3);
+  // params layout (>=3 entries; later entries are optional for back-compat):
+  //   [0] num_groups
+  //   [1] topk_group
+  //   [2] bitcast<int>(routed_scaling_factor)
+  //   [3] local_expert_start   (default 0)
+  //   [4] local_expert_end     (default num_experts)
+  //   [5] score_func           (default 0 = Sigmoid; 1 = SqrtSoftplus, 2 = Softmax)
+  assert(params.size() >= 3);
   int num_groups = params[0];
   int topk_group = params[1];
   float scaling_factor;
   memcpy(&scaling_factor, &params[2], sizeof(float));
+  int score_func = (params.size() >= 6) ? params[5] : 0;
+  assert(score_func >= 0 && score_func <= 2);
 
   int batch_size = 0, num_experts = 0, num_experts_per_tok = 0;
   std::vector<tb::TBInputOp *> input_ops;
@@ -2543,10 +2552,23 @@ int TaskRegister::register_moe_topk_sigmoid_sm100_task(
          "Number of experts must be divisible by number of groups");
   int experts_per_group = num_experts / num_groups;
 
+  int local_expert_start = (params.size() >= 5) ? params[3] : 0;
+  int local_expert_end = (params.size() >= 5) ? params[4] : num_experts;
+  assert(0 <= local_expert_start);
+  assert(local_expert_start <= local_expert_end);
+  assert(local_expert_end <= num_experts);
+
+  char const *score_func_str = "kernel::ScoreFunc::Sigmoid";
+  if (score_func == 1) {
+    score_func_str = "kernel::ScoreFunc::SqrtSoftplus";
+  } else if (score_func == 2) {
+    score_func_str = "kernel::ScoreFunc::Softmax";
+  }
+
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
   code.e("kernel::topk_sigmoid_task_impl<cute::bfloat16_t, $, $, $, $, $, $, "
-         "$, $>(",
+         "$, $, $>(",
          /*VPT=*/8,
          /*EXPERTS=*/num_experts,
          /*WARPS_PER_TB=*/8,
@@ -2554,7 +2576,8 @@ int TaskRegister::register_moe_topk_sigmoid_sm100_task(
          /*NUM_GROUPS=*/num_groups,
          /*TOPK_GROUP=*/topk_group,
          /*EXPERTS_PER_GROUP=*/experts_per_group,
-         /*TOPK_EXPERTS=*/num_experts_per_tok);
+         /*TOPK_EXPERTS=*/num_experts_per_tok,
+         /*SCORE_FUNC=*/score_func_str);
   code.e("    task_desc->input_ptrs[0],");
   code.e("    task_desc->input_ptrs[1],");
   code.e("    nullptr,");
@@ -2562,8 +2585,8 @@ int TaskRegister::register_moe_topk_sigmoid_sm100_task(
   code.e("    $,", batch_size);
   code.e("    task_desc->output_ptrs[1],");
   code.e("    task_desc->output_ptrs[2],");
-  code.e("    0,");
-  code.e("    $,", num_experts);
+  code.e("    $,", local_expert_start);
+  code.e("    $,", local_expert_end);
   code.e("    $f);", scaling_factor);
   return register_task_variant(TASK_MOE_TOPK_SIGMOID_SM100, code.to_string());
 }
