@@ -116,6 +116,7 @@ from .moe import (
     MoeMulSumAdd,
     MoEPermute,
     MoEUnpermute,
+    HashRouteLookup,
 )
 
 # HC (Hyper-Connections — DeepSeek V4-Flash)
@@ -231,6 +232,7 @@ __all__ = [
     "MoeMulSumAdd",
     "MoEPermute",
     "MoEUnpermute",
+    "HashRouteLookup",
     # HC (Hyper-Connections)
     "MhcPrenormGemm",
     "MhcPre",

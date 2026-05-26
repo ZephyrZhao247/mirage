@@ -676,6 +676,12 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         customized->bgraph, params);
     // 4 inputs (residual, fn, hc_scale, hc_base), 1 output
     task_config[op] = std::make_tuple(4, 1, TASK_MHC_HEAD_SM100, variant_id);
+  } else if (name == "hash_route_lookup_sm100") {
+    int variant_id = task_register->register_hash_route_lookup_sm100_task(
+        customized->bgraph, params);
+    // 2 inputs (input_ids, tid2eid), 2 outputs (expert_ids, topk_weights)
+    task_config[op] =
+        std::make_tuple(2, 2, TASK_HASH_ROUTE_LOOKUP_SM100, variant_id);
   } else if (name == "softmax_gather_sm100") {
     int variant_id = task_register->register_softmax_gather_sm100_task(
         customized->bgraph, params);

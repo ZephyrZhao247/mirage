@@ -11,6 +11,7 @@ as back-compat factories so existing model code still works.
 * :class:`MoESiluMul`     -> ``moe_silu_mul``
 * :class:`MoeMulSumAdd`   -> ``moe_mul_sum_add_sm100``
 * :class:`MoEPermute` / :class:`MoEUnpermute` -> ``moe_permute_sm100`` / ``moe_unpermute_sm100``
+* :class:`HashRouteLookup` -> ``hash_route_lookup_sm100`` (DeepSeek V4-Flash, early layers)
 """
 
 from .routing import (
@@ -23,6 +24,7 @@ from .w2 import MoEW2BF16, MoEW2FP8, MoEW2      # MoEW2  = back-compat factory
 from .silu_mul import MoESiluMul
 from .mul_sum_add import MoeMulSumAdd
 from .permute import MoEPermute, MoEUnpermute
+from .hash_route_lookup import HashRouteLookup
 
 __all__ = [
     # Routing
@@ -42,4 +44,6 @@ __all__ = [
     "MoeMulSumAdd",
     "MoEPermute",
     "MoEUnpermute",
+    # V4-Flash
+    "HashRouteLookup",
 ]

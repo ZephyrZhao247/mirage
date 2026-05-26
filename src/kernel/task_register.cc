@@ -4912,5 +4912,62 @@ int TaskRegister::register_mhc_pre_sm100_task(
   return register_task_variant(TASK_MHC_PRE_SM100, code.to_string());
 }
 
+int TaskRegister::register_hash_route_lookup_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // V4-Flash hash routing for early MoE layers.
+  //
+  // Inputs:
+  //   input_ids [num_tokens_total]              int32 (broadcast)
+  //   tid2eid   [vocab_size, K_TOPK]            int32 (broadcast)
+  // Outputs:
+  //   expert_ids   [num_tokens_total, K_TOPK]   int32 (broadcast — kernel
+  //                                                    addresses via
+  //                                                    token_offset)
+  //   topk_weights [num_tokens_total, K_TOPK]   fp32  (same)
+  //
+  // K_TOPK is read from the trailing dim of tid2eid. No `params` are needed
+  // (num_tokens_per_task is fixed to 1 in v1: one CTA per token).
+  assert(params.size() == 0);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int const num_inputs = 2;
+  int const num_outputs = 2;
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  // input_ops[0] = input_ids  [num_tokens_total] int32
+  // input_ops[1] = tid2eid    [vocab_size, K_TOPK] int32
+  // output_ops[0] = expert_ids   [num_tokens_total, K_TOPK] int32
+  // output_ops[1] = topk_weights [num_tokens_total, K_TOPK] fp32
+  assert(input_ops[0]->dtensor.num_dims == 1);
+  assert(input_ops[1]->dtensor.num_dims == 2);
+  int num_tokens_total = input_ops[0]->dtensor.dim[0];
+  int k_topk = input_ops[1]->dtensor.dim[1];
+  assert(output_ops[0]->dtensor.num_dims == 2);
+  assert(output_ops[0]->dtensor.dim[0] == num_tokens_total);
+  assert(output_ops[0]->dtensor.dim[1] == k_topk);
+  assert(output_ops[1]->dtensor.num_dims == 2);
+  assert(output_ops[1]->dtensor.dim[0] == num_tokens_total);
+  assert(output_ops[1]->dtensor.dim[1] == k_topk);
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::hash_route_lookup_task_impl<$>(", k_topk);
+  code.e("    task_desc->input_ptrs[0],");   // input_ids
+  code.e("    task_desc->input_ptrs[1],");   // tid2eid
+  code.e("    task_desc->output_ptrs[0],");  // expert_ids
+  code.e("    task_desc->output_ptrs[1],");  // topk_weights
+  code.e("    task_desc->task_metadata.token_offset,");
+  code.e("    1,"); // num_tokens_per_task = 1 (v1: one CTA per token)
+  code.e("    $);", num_tokens_total);
+  return register_task_variant(TASK_HASH_ROUTE_LOOKUP_SM100, code.to_string());
+}
+
 } // namespace runtime
 } // namespace mirage
