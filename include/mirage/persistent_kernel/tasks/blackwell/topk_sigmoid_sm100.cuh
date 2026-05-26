@@ -157,7 +157,14 @@ __device__ __forceinline__ void topk_sigmoid_task_impl(
   int const warp_base_row = warp_idx * ROWS_PER_WARP;
 
   int const thread_row_in_warp = lane_idx / THREADS_PER_ROW;
-  int const thread_row = warp_base_row + thread_row_in_warp;
+
+  // Outer row-base loop: one CTA covers WARPS_PER_CTA * ROWS_PER_WARP rows
+  // per iteration. For num_rows > WARPS_PER_CTA * ROWS_PER_WARP, iterate.
+  // (Wave 1.5 V3 fix; previously only the first 8 rows were processed.)
+  static constexpr int ROWS_PER_CTA_SIGMOID = WARPS_PER_CTA * ROWS_PER_WARP;
+  for (int row_base = 0; row_base < num_rows;
+       row_base += ROWS_PER_CTA_SIGMOID) {
+  int const thread_row = row_base + warp_base_row + thread_row_in_warp;
   uint32_t const warp_mask = (num_rows % 2 == 1 && thread_row == num_rows - 1)
                                  ? 0x0000ffff
                                  : 0xffffffff;
@@ -346,6 +353,7 @@ __device__ __forceinline__ void topk_sigmoid_task_impl(
     }
   }
   __syncthreads();
+  } // end outer row_base loop
 
   // ---- Phase 7: Compact active expert IDs ----
   if (mpk_active_expert_ids != nullptr) {

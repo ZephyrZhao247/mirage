@@ -194,7 +194,23 @@ enum TaskType {
   TASK_MTP_BUILD_EMBED_INPUT = 294,
   // MLA prefill TP=8: unabsorbed, TMA K/V, seq_len<=4096.
   TASK_MLA_PREFILL_TP8_SM100 = 295,
-  TASK_SM100_TASK_END = 298, // SM100 end placeholder, not a real task
+  // DeepSeek-V4-Flash Wave-2 task slots (pre-allocated; registration is per
+  // kernel agent in their own worktree — these IDs reserve the range).
+  TASK_MHC_PRENORM_GEMM_SM100 = 298,        // Wave-2: mhc_prenorm_gemm
+  TASK_MHC_PRE_SM100 = 299,                 // Wave-2: mhc_pre
+  TASK_MHC_POST_SM100 = 300,                // Wave-2: mhc_post
+  TASK_MHC_HEAD_SM100 = 301,                // Wave-2: mhc_head
+  TASK_MLA_V4_Q_KV_RMSNORM_SM100 = 302,     // Wave-2: mla_v4_q_kv_rmsnorm
+  TASK_MLA_V4_DECODE_SM100 = 303,           // Wave-2: mla_v4_decode
+  TASK_MLA_V4_PREFILL_SM100 = 304,          // Wave-2: mla_v4_prefill
+  TASK_MLA_V4_PREFILL_GATHER_SM100 = 305,   // Wave-2: mla_v4_prefill_gather
+  TASK_INV_ROPE_FP8_QUANT_O_SM100 = 306,    // Wave-2: inv_rope_fp8_quant_o
+  TASK_COMPRESSOR_STATE_UPDATE_SM100 = 307, // Wave-2: compressor_state_update
+  TASK_COMPRESSOR_COMPRESS_SM100 = 308,     // Wave-2: compressor_compress
+  TASK_INDEXER_Q_TRANSFORM_SM100 = 309,     // Wave-2: indexer_q_transform
+  TASK_INDEXER_SCORE_TOPK_SM100 = 310,      // Wave-2: indexer_score_topk
+  TASK_HASH_ROUTE_LOOKUP_SM100 = 311,       // Wave-2: hash_route_lookup
+  TASK_SM100_TASK_END = 320, // SM100 end placeholder, not a real task
   TASK_SCHD_TASKS = 200,
   TASK_SCHD_EVENTS = 201,
   TASK_GET_EVENT = 202,
@@ -265,6 +281,10 @@ struct FullTaskDesc {
     };
     struct {
       int task_offset; // Used for nvshmem team mapping
+    };
+    struct {
+      int token_offset;        // Used for HC/attention/sparse tasks (slice over num_tokens)
+      int num_tokens_per_task; // Companion: number of tokens this CTA processes
     };
     unsigned long long raw_payload;
   } task_metadata;

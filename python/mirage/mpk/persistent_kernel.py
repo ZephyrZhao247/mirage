@@ -30,9 +30,21 @@ def _allocate_meta_tensors(rt: "RuntimeConfig", max_num_pages: int) -> dict:
 
     All buffers live on ``cuda``. ``tokens``/``prompt_lengths`` are
     zero-initialized; :meth:`PersistentKernel.run` fills them per call.
+
+    DeepSeek-V4 additionally needs Compressor and Indexer paged-KV metadata
+    triples (Wave 1.5). They are allocated alongside the V3 paged-KV trio so
+    layer builders can reference them; they are NOT forwarded to the C++
+    runtime in ``expected_order`` (the C++ ``init_persistent_kernel`` asserts
+    ``meta_tensors.size() == 11`` — see ``persistent_kernel.cuh:1187``). The
+    wiring to C++ for these new triples happens in a follow-up runtime patch.
     """
     device = "cuda"
     n_req = rt.max_num_batched_requests
+    # Per-V4-Flash placeholders for compressed/indexer cache page budgets.
+    # Refined per layer in Wave-3 once compress_ratio / token-window sizing
+    # is finalized; for Wave 1.5 use multiples of max_num_pages.
+    max_num_compressor_pages = 8 * max_num_pages
+    max_num_indexer_pages = 4 * max_num_pages
     return {
         "tokens": torch.zeros((n_req, rt.max_seq_length),
                               dtype=torch.long, device=device),
@@ -48,6 +60,14 @@ def _allocate_meta_tensors(rt: "RuntimeConfig", max_num_pages: int) -> dict:
         "paged_kv_indptr_buffer": torch.empty(n_req + 1, dtype=torch.int32, device=device),
         "paged_kv_indices_buffer": torch.empty(max_num_pages, dtype=torch.int32, device=device),
         "paged_kv_last_page_len_buffer": torch.empty(n_req, dtype=torch.int32, device=device),
+        # DeepSeek-V4 Compressor paged-KV triple (Wave 1.5; Python-side only).
+        "compressor_kv_indptr_buffer": torch.empty(n_req + 1, dtype=torch.int32, device=device),
+        "compressor_kv_indices_buffer": torch.empty(max_num_compressor_pages, dtype=torch.int32, device=device),
+        "compressor_kv_last_page_len_buffer": torch.empty(n_req, dtype=torch.int32, device=device),
+        # DeepSeek-V4 Indexer paged-KV triple (Wave 1.5; Python-side only).
+        "indexer_kv_indptr_buffer": torch.empty(n_req + 1, dtype=torch.int32, device=device),
+        "indexer_kv_indices_buffer": torch.empty(max_num_indexer_pages, dtype=torch.int32, device=device),
+        "indexer_kv_last_page_len_buffer": torch.empty(n_req, dtype=torch.int32, device=device),
     }
 
 HARD_CODE = """
@@ -444,6 +464,11 @@ class PersistentKernel:
         self.max_num_batched_requests = max_num_batched_requests
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_num_pages = max_num_pages
+        # DeepSeek-V4 Compressor / Indexer paged-cache page budgets (Wave 1.5).
+        # Placeholder multiples of ``max_num_pages``; refined per layer in
+        # Wave-3 when compress_ratio sizing is finalized.
+        self.max_num_compressor_pages = 8 * max_num_pages
+        self.max_num_indexer_pages = 4 * max_num_pages
         self.page_size = page_size
         self.eos_token_id = eos_token_id
         self.kn_graph = KNGraph(CyKNGraph(disable_fingerprint=True))
@@ -569,6 +594,30 @@ class PersistentKernel:
                 self.max_num_pages, dtype=torch.int32, device=device)
         if "paged_kv_last_page_len_buffer" not in self.meta_tensors:
             self.meta_tensors["paged_kv_last_page_len_buffer"] = torch.zeros(
+                self.max_num_batched_requests,
+                dtype=torch.int32, device=device)
+        # DeepSeek-V4 Compressor paged-KV triple (Wave 1.5).
+        if "compressor_kv_indptr_buffer" not in self.meta_tensors:
+            self.meta_tensors["compressor_kv_indptr_buffer"] = torch.zeros(
+                self.max_num_batched_requests + 1,
+                dtype=torch.int32, device=device)
+        if "compressor_kv_indices_buffer" not in self.meta_tensors:
+            self.meta_tensors["compressor_kv_indices_buffer"] = torch.zeros(
+                self.max_num_compressor_pages, dtype=torch.int32, device=device)
+        if "compressor_kv_last_page_len_buffer" not in self.meta_tensors:
+            self.meta_tensors["compressor_kv_last_page_len_buffer"] = torch.zeros(
+                self.max_num_batched_requests,
+                dtype=torch.int32, device=device)
+        # DeepSeek-V4 Indexer paged-KV triple (Wave 1.5).
+        if "indexer_kv_indptr_buffer" not in self.meta_tensors:
+            self.meta_tensors["indexer_kv_indptr_buffer"] = torch.zeros(
+                self.max_num_batched_requests + 1,
+                dtype=torch.int32, device=device)
+        if "indexer_kv_indices_buffer" not in self.meta_tensors:
+            self.meta_tensors["indexer_kv_indices_buffer"] = torch.zeros(
+                self.max_num_indexer_pages, dtype=torch.int32, device=device)
+        if "indexer_kv_last_page_len_buffer" not in self.meta_tensors:
+            self.meta_tensors["indexer_kv_last_page_len_buffer"] = torch.zeros(
                 self.max_num_batched_requests,
                 dtype=torch.int32, device=device)
 
