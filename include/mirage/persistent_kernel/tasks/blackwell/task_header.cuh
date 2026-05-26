@@ -52,6 +52,7 @@
 #include "prob_scatter_sm100.cuh"
 #include "sm100_ptx.cuh"
 #include "softmax_gather_sm100.cuh"
+#include "sum_of_squares_sm100.cuh"
 #include "tasks/common/sampling.cuh"
 #include "tasks/speculative_decoding/mtp_token_ops.cuh"
 #include "tasks/speculative_decoding/prompt_lookup.cuh"

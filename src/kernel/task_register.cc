@@ -2185,7 +2185,7 @@ int TaskRegister::register_mhc_post_sm100_task(
   assert(input_ops[3]->dtensor.num_dims == 2);
   assert(input_ops[3]->dtensor.dim[1] == H);
 
-  int num_threads = (params.size() == 1) ? params[0] : 128;
+  int num_threads_mp = (params.size() == 1) ? params[0] : 128;
   // Choose h_blk = gcd(H, 1024) to match TileLang's `mhc_post_tilelang`
   // pipeline tiling. For H=4096 -> h_blk=1024 -> 4 tiles. For H<=1024 ->
   // h_blk=H -> 1 tile.
@@ -2200,11 +2200,9 @@ int TaskRegister::register_mhc_post_sm100_task(
   int h_blk = gcd(H, 1024);
   // h_blk must be a multiple of num_threads for the per-thread tile loop.
   // If not, fall back to the smallest factor of h_blk >= num_threads.
-  while (h_blk % num_threads != 0) {
-    // Shrink h_blk by halving until it becomes a multiple of num_threads.
-    // (For H=128, num_threads=128 -> h_blk=128 already works.)
-    if (h_blk < num_threads) {
-      h_blk = num_threads;
+  while (h_blk % num_threads_mp != 0) {
+    if (h_blk < num_threads_mp) {
+      h_blk = num_threads_mp;
       break;
     }
     h_blk /= 2;
@@ -2217,13 +2215,56 @@ int TaskRegister::register_mhc_post_sm100_task(
          /*HC=*/hc,
          /*H=*/H,
          /*H_BLK=*/h_blk,
-         /*NUM_THREADS=*/num_threads);
+         /*NUM_THREADS=*/num_threads_mp);
   code.e("    task_desc->input_ptrs[0],");
   code.e("    task_desc->input_ptrs[1],");
   code.e("    task_desc->input_ptrs[2],");
   code.e("    task_desc->input_ptrs[3],");
   code.e("    task_desc->output_ptrs[0]);");
   return register_task_variant(TASK_MHC_POST_SM100, code.to_string());
+}
+
+int TaskRegister::register_sum_of_squares_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // V4 mHC prenorm-GEMM v1 (decomposed, naive — see hc.md §1.7).
+  //
+  // Inputs:
+  //   residual_row [BATCH_SIZE, REDUCTION_SIZE] bf16 (partitioned row-wise)
+  //   fn           [OUTPUT_SIZE,  REDUCTION_SIZE] bf16 (broadcast)
+  // Outputs:
+  //   gemm_out_mul     [BATCH_SIZE, OUTPUT_SIZE] bf16 (partitioned row-wise)
+  //   gemm_out_sqrsum  [BATCH_SIZE]              fp32 (partitioned row-wise)
+  assert(params.size() == 0);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 2;
+  int num_outputs = 2;
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  assert(input_ops[0]->output_tensors[0].num_dims == 2);
+  assert(input_ops[1]->output_tensors[0].num_dims == 2);
+  int reduction_size = input_ops[0]->output_tensors[0].dim[1];
+  int output_size = input_ops[1]->output_tensors[0].dim[0]; // hc3
+  int num_threads_sq = bgraph.block_dim.x;
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::sum_of_squares_sm100_task_impl<cute::bfloat16_t, "
+         "cute::bfloat16_t, $, $, $>(",
+         /*OUTPUT_SIZE=*/output_size,
+         /*REDUCTION_SIZE=*/reduction_size,
+         /*NUM_THREADS=*/num_threads_sq);
+  code.e("    task_desc->input_ptrs[0],");
+  code.e("    task_desc->input_ptrs[1],");
+  code.e("    task_desc->output_ptrs[0],");
+  code.e("    task_desc->output_ptrs[1]);");
+  return register_task_variant(TASK_SUM_OF_SQUARES_SM100, code.to_string());
 }
 
 int TaskRegister::register_softmax_gather_sm100_task(
