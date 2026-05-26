@@ -241,6 +241,9 @@ void register_mugraph(
   // LCM) aborts compilation here so we fail early with a clear message
   // instead of silently producing a wrong schedule.
   AnnotatedGraph ag = build_annotated_graph(graph, task_configs);
+  fprintf(stderr, "[register_mugraph] AG built: %zu layers, %zu edges\n",
+          ag.layers.size(), ag.edges.size());
+  fflush(stderr);
   if (char const *env = std::getenv("MIRAGE_DUMP_ANNOTATED_GRAPH");
       env != nullptr && std::string(env) != "0") {
     std::string dump = maybe_dump_annotated_graph(ag);
@@ -667,12 +670,18 @@ void register_mugraph(
 
     // ---- First layer (no in-edges after residual stripping): lex emit.
     if (L.in_edges.empty() && L.fork_parent_group < 0) {
+      fprintf(stderr, "[register_mugraph] First-layer emit: layer_idx=%d task_type=%d num_in=%d num_out=%d grid=(%u,%u,%u)\n",
+              layer_idx, (int)task_type, num_inputs, num_outputs,
+              cur_grid.x, cur_grid.y, cur_grid.z);
+      fflush(stderr);
       std::vector<FullTaskDesc> tasks = build_tasks_bid_lex(cur_op,
                                                             task_type,
                                                             variant_id,
                                                             cur_num_subtasks,
                                                             input_ops,
                                                             output_ops);
+      fprintf(stderr, "[register_mugraph] After build_tasks_bid_lex: tasks=%zu\n", tasks.size());
+      fflush(stderr);
       dim3 b;
       for (b.x = 0; b.x < cur_grid.x; b.x++) {
         for (b.y = 0; b.y < cur_grid.y; b.y++) {
@@ -943,6 +952,9 @@ void register_mugraph(
   }
   all_events.push_back(
       EventDesc(EVENT_END_OF_TASK_GRAPH, end_num_triggers, 0, 0));
+  fprintf(stderr, "[register_mugraph] After leaf events. all_tasks=%zu all_events=%zu end_num_triggers=%zu\n",
+          all_tasks.size(), all_events.size(), end_num_triggers);
+  fflush(stderr);
 
   // Prelaunch all tasks at the begining of an iteration
   all_events[1].first_task_id = 2;
@@ -1825,6 +1837,7 @@ TaskGraphResult print_task_graph(
   task_type_to_name[TASK_ELEMENTWISE_ADD_SM100] = "TASK_ELEMENTWISE_ADD_SM100";
   task_type_to_name[TASK_MHC_POST_SM100] = "TASK_MHC_POST_SM100";
   task_type_to_name[TASK_SUM_OF_SQUARES_SM100] = "TASK_SUM_OF_SQUARES_SM100";
+  task_type_to_name[TASK_MHC_HEAD_SM100] = "TASK_MHC_HEAD_SM100";
   task_type_to_name[TASK_SOFTMAX_GATHER_SM100] = "TASK_SOFTMAX_GATHER_SM100";
   task_type_to_name[TASK_MTP_VERIFY_PROBABILISTIC] =
       "TASK_MTP_VERIFY_PROBABILISTIC";

@@ -2267,6 +2267,45 @@ int TaskRegister::register_sum_of_squares_sm100_task(
   return register_task_variant(TASK_SUM_OF_SQUARES_SM100, code.to_string());
 }
 
+int TaskRegister::register_mhc_head_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0] = HC (defaults to 4 if absent)
+  int hc = params.size() > 0 ? params[0] : 4;
+  std::vector<tb::TBInputOp *> input_ops_h;
+  std::vector<tb::TBInputOp *> output_ops_h;
+  int num_inputs_h = 4;  // residual, fn, hc_scale, hc_base
+  int num_outputs_h = 1; // out
+  assert(bgraph.operators.size() == (size_t)num_inputs_h + num_outputs_h);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops_h.size() < (size_t)num_inputs_h) {
+      input_ops_h.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops_h.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  // residual shape: [N, hc, H] (3-D) — per-task slice is [batch_size, hc, H].
+  int batch_size_h = input_ops_h[0]->output_tensors[0].dim[0];
+  int residual_hc = input_ops_h[0]->dtensor.dim[1];
+  int hidden_size = input_ops_h[0]->dtensor.dim[2];
+  (void)residual_hc;
+
+  mirage::transpiler::CodeKeeper code_h;
+  code_h.inc_indent();
+  code_h.e("kernel::mhc_head_task_impl<cute::bfloat16_t, $, $, $>(",
+           /*BATCH_SIZE=*/batch_size_h,
+           /*HC=*/hc,
+           /*H=*/hidden_size);
+  code_h.e("    task_desc->input_ptrs[0],"); // residual
+  code_h.e("    task_desc->input_ptrs[1],"); // fn
+  code_h.e("    task_desc->input_ptrs[2],"); // hc_scale
+  code_h.e("    task_desc->input_ptrs[3],"); // hc_base
+  code_h.e("    task_desc->output_ptrs[0],");
+  code_h.e("    1e-6f,");  // rms_eps
+  code_h.e("    1e-6f);"); // hc_eps
+  return register_task_variant(TASK_MHC_HEAD_SM100, code_h.to_string());
+}
+
 int TaskRegister::register_softmax_gather_sm100_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
   assert(params.size() == 0);

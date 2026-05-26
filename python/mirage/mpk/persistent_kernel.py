@@ -2832,6 +2832,51 @@ class PersistentKernel:
             [residual, fn, gemm_out_mul, gemm_out_sqrsum], tb_graph)
         self.kn_graph.register_task(tb_graph, "sum_of_squares_sm100")
 
+    def mhc_head_layer(
+        self,
+        residual: DTensor,
+        fn: DTensor,
+        hc_scale: DTensor,
+        hc_base: DTensor,
+        out: DTensor,
+        grid_dim: tuple,
+        block_dim: tuple = (128, 1, 1),
+    ):
+        """DeepSeek V4-Flash mhc_head — final HC collapse before lm_head.
+
+        Two-pass per-token: pass 1 accumulates per-token sqrsum + hc dot-products
+        with rows of fn; pass 2 applies the sigmoid-gated weighted reduction to
+        collapse [N, hc, H] -> [N, H].
+
+        Inputs:
+            residual : [N, hc, H] bf16
+            fn       : [hc, hc*H] fp32
+            hc_scale : [1] fp32
+            hc_base  : [hc] fp32
+            out      : [N, H] bf16
+        """
+        assert residual.num_dims == 3
+        assert fn.num_dims == 2
+        assert hc_scale.num_dims == 1
+        assert hc_base.num_dims == 1
+        assert out.num_dims == 2
+        hc = residual.dim(1)
+        H = residual.dim(2)
+        assert fn.dim(0) == hc
+        assert fn.dim(1) == hc * H
+        assert hc_scale.dim(0) == 1
+        assert hc_base.dim(0) == hc
+        assert out.dim(1) == H
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(residual, (0, -1, -1), -1, True)
+        tb_graph.new_input(fn, (-1, -1, -1), -1, True)
+        tb_graph.new_input(hc_scale, (-1, -1, -1), -1, True)
+        tb_graph.new_input(hc_base, (-1, -1, -1), -1, True)
+        tb_graph.new_input(out, (0, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [residual, fn, hc_scale, hc_base, out], tb_graph)
+        self.kn_graph.register_task(tb_graph, "mhc_head_sm100", [int(hc)])
+
     def silu_mul_linear_with_residual_layer(
         self,
         input: DTensor,
