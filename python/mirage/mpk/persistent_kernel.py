@@ -3255,17 +3255,40 @@ class PersistentKernel:
             "paged_kv_indices_buffer",
             "paged_kv_last_page_len_buffer",
             "paged_kv_indices_snapshot",
+            # V4 Compressor compressed-KV paged cache trio
+            "compressor_kv_indptr_buffer",
+            "compressor_kv_indices_buffer",
+            "compressor_kv_last_page_len_buffer",
+            # V4 Indexer FP8/UE8M0 paged cache trio
+            "indexer_kv_indptr_buffer",
+            "indexer_kv_indices_buffer",
+            "indexer_kv_last_page_len_buffer",
         ]
+        # V4-only meta tensors are optional for non-V4 models (V3, qwen3, etc.).
+        # Lazily allocate a 1-element int32 placeholder so the C-side pointer
+        # check passes; V3 kernels never dereference these buffers.
+        optional_meta_keys = {
+            "compressor_kv_indptr_buffer",
+            "compressor_kv_indices_buffer",
+            "compressor_kv_last_page_len_buffer",
+            "indexer_kv_indptr_buffer",
+            "indexer_kv_indices_buffer",
+            "indexer_kv_last_page_len_buffer",
+        }
         meta_tensors_ptr = []
         for key in expected_order:
             if key not in self.meta_tensors:
                 if self.test_mode:
-                    # In test mode, we can allow missing meta tensors and pass null pointer
-                    meta_tensors_ptr.append(0)  
+                    meta_tensors_ptr.append(0)
+                elif key in optional_meta_keys:
+                    self.meta_tensors[key] = torch.zeros(
+                        1, dtype=torch.int32, device="cuda"
+                    )
+                    meta_tensors_ptr.append(self.meta_tensors[key].data_ptr())
                 else:
-                  raise ValueError(f"Missing meta tensor: {key}")
+                    raise ValueError(f"Missing meta tensor: {key}")
             else:
-              meta_tensors_ptr.append(self.meta_tensors[key].data_ptr())
+                meta_tensors_ptr.append(self.meta_tensors[key].data_ptr())
         profiler_buffer_ptr = (
             self.profiler_tensor.data_ptr() if self.profiler_tensor is not None else 0
         )

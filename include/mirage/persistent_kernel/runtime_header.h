@@ -363,6 +363,14 @@ struct RuntimeConfig {
   int *paged_kv_indices_buffer;   // Metadata for LLM serving (paged attention)
   int *paged_kv_indices_snapshot; // Scheduler snapshot for in-place compaction
   int *paged_kv_last_page_len_buffer; // Metadata for LLM serving
+  // V4 Compressor compressed-KV paged cache (per-cache trio; coexists with paged_kv_*)
+  int *compressor_kv_indptr_buffer;
+  int *compressor_kv_indices_buffer;
+  int *compressor_kv_last_page_len_buffer;
+  // V4 Indexer FP8/UE8M0 paged cache (per-cache trio)
+  int *indexer_kv_indptr_buffer;
+  int *indexer_kv_indices_buffer;
+  int *indexer_kv_last_page_len_buffer;
 #if defined(MODE_OFFLINE) || defined(MODE_ONLINE) ||                           \
     defined(MODE_ONLINE_NOTOKEN)
   int *prompt_length;     // Metadata for online/offline serving

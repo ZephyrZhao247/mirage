@@ -1184,7 +1184,7 @@ extern "C" void
                            int is_test_mode,
                            std::vector<std::string> model_tensor_names,
                            std::vector<void *> model_tensor_ptrs) {
-  assert(meta_tensors.size() == 11);
+  assert(meta_tensors.size() == 17);
 
   // Build global model tensors map from parallel vectors
   assert(model_tensor_names.size() == model_tensor_ptrs.size());
@@ -1209,6 +1209,20 @@ extern "C" void
       static_cast<int *>(meta_tensors[9]);
   global_runtime_config.paged_kv_indices_snapshot =
       static_cast<int *>(meta_tensors[10]);
+  // V4 Compressor compressed-KV paged cache trio
+  global_runtime_config.compressor_kv_indptr_buffer =
+      static_cast<int *>(meta_tensors[11]);
+  global_runtime_config.compressor_kv_indices_buffer =
+      static_cast<int *>(meta_tensors[12]);
+  global_runtime_config.compressor_kv_last_page_len_buffer =
+      static_cast<int *>(meta_tensors[13]);
+  // V4 Indexer FP8/UE8M0 paged cache trio
+  global_runtime_config.indexer_kv_indptr_buffer =
+      static_cast<int *>(meta_tensors[14]);
+  global_runtime_config.indexer_kv_indices_buffer =
+      static_cast<int *>(meta_tensors[15]);
+  global_runtime_config.indexer_kv_last_page_len_buffer =
+      static_cast<int *>(meta_tensors[16]);
   global_runtime_config.num_workers = num_workers;
   global_runtime_config.num_local_schedulers = num_local_schedulers;
   global_runtime_config.num_remote_schedulers = num_remote_schedulers;
