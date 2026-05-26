@@ -1,11 +1,13 @@
 """Attention layers (plain decode + paged; MLA / split-KV come in follow-ups)."""
 
 from .attention import Attention
+from .mla_v4_q_kv_rmsnorm import MLAv4QKVRMSNorm
 from .paged_attention import PagedAttention
 from .single_batch_extend_attention import SingleBatchExtendAttention
 
 __all__ = [
     "Attention",
+    "MLAv4QKVRMSNorm",
     "PagedAttention",
     "SingleBatchExtendAttention",
 ]
