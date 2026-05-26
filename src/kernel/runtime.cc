@@ -431,6 +431,12 @@ void register_mugraph(
             if (task_type == TASK_QUANTIZE_FP8_SM100) {
               task.task_metadata.request_id = bid.x;
             }
+            // DeepSeek V4-Flash mHC pre: grid=(num_tokens,), one CTA per token.
+            // token_offset = bid.x; num_tokens_per_task = 1.
+            if (task_type == TASK_MHC_PRE_SM100) {
+              task.task_metadata.token_offset = bid.x;
+              task.task_metadata.num_tokens_per_task = 1;
+            }
             if (task_type == TASK_NVSHMEM_TILE_ALLREDUCE) {
               task.task_metadata.task_offset =
                   bid.x + bid.y * bgraph.grid_dim.x +
@@ -1838,6 +1844,8 @@ TaskGraphResult print_task_graph(
       "TASK_NVSHMEM_ALLGATHER_STRIDED_PUT";
   task_type_to_name[TASK_NVSHMEM_TILE_ALLREDUCE] =
       "TASK_NVSHMEM_TILE_ALLREDUCE";
+  // DeepSeek V4-Flash mHC tasks
+  task_type_to_name[TASK_MHC_PRE_SM100] = "TASK_MHC_PRE_SM100";
 
   code.e("__device__ __forceinline__");
   code.e("void _execute_task(TaskDesc const* task_desc,");

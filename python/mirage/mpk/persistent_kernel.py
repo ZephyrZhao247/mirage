@@ -2632,6 +2632,57 @@ class PersistentKernel:
         self.kn_graph.customized([input_a, input_b, output], tb_graph)
         self.kn_graph.register_task(tb_graph, "elementwise_add_sm100")
 
+    def mhc_pre_layer(
+        self,
+        gemm_out_mul: DTensor,    # [splits, N, hc3] fp32
+        gemm_out_sqrsum: DTensor, # [splits, N]     fp32
+        hc_scale: DTensor,        # [3]              fp32
+        hc_base: DTensor,         # [hc3]            fp32
+        residual: DTensor,        # [N, hc, H]       bf16
+        post_mix: DTensor,        # [N, hc]          fp32
+        comb_mix: DTensor,        # [N, hc, hc]      fp32 (or [N, hc*hc])
+        layer_input: DTensor,     # [N, H]           bf16
+        grid_dim: tuple,
+        block_dim: tuple,
+    ):
+        """DeepSeek V4-Flash mHC pre block (port of vLLM `mhc_pre_big_fuse_tilelang`).
+
+        Reduces split-K gemm outputs, finalizes RMSNorm via rsqrt, applies K2
+        affine + sigmoid split to produce `post_mix`, runs 20-iter Sinkhorn on
+        a 4x4 `comb_mix`, and performs the K4 head reduction
+        `layer_input[n, h] = sum_j pre[j] * residual[n, j, h]`.
+
+        Grid: one CTA per token. Each CTA derives `n` from
+        `task_metadata.token_offset` (NOT blockIdx). v1 is serial / naive
+        (no warp specialization, no async copy); FP32 accumulators throughout.
+        """
+        assert gemm_out_mul.num_dims == 3      # [splits, N, hc3]
+        assert gemm_out_sqrsum.num_dims == 2   # [splits, N]
+        assert hc_scale.num_dims == 1          # [3]
+        assert hc_base.num_dims == 1           # [hc3]
+        assert residual.num_dims == 3          # [N, hc, H]
+        assert post_mix.num_dims == 2          # [N, hc]
+        # comb_mix may be [N, hc, hc] or [N, hc*hc] — accept either.
+        assert comb_mix.num_dims in (2, 3)
+        assert layer_input.num_dims == 2       # [N, H]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        # All inputs/outputs are accessed via task_metadata.token_offset,
+        # not via TB grid partitioning, so use (-1, -1, -1).
+        tb_graph.new_input(gemm_out_mul,    (-1, -1, -1), -1, True)
+        tb_graph.new_input(gemm_out_sqrsum, (-1, -1, -1), -1, True)
+        tb_graph.new_input(hc_scale,        (-1, -1, -1), -1, True)
+        tb_graph.new_input(hc_base,         (-1, -1, -1), -1, True)
+        tb_graph.new_input(residual,        (-1, -1, -1), -1, True)
+        tb_graph.new_input(post_mix,        (-1, -1, -1), -1, True)
+        tb_graph.new_input(comb_mix,        (-1, -1, -1), -1, True)
+        tb_graph.new_input(layer_input,     (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [gemm_out_mul, gemm_out_sqrsum, hc_scale, hc_base, residual,
+             post_mix, comb_mix, layer_input],
+            tb_graph,
+        )
+        self.kn_graph.register_task(tb_graph, "mhc_pre_sm100")
+
     def silu_mul_linear_with_residual_layer(
         self,
         input: DTensor,
