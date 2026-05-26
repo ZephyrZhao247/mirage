@@ -2145,6 +2145,54 @@ int TaskRegister::register_elementwise_add_sm100_task(
   return register_task_variant(TASK_ELEMENTWISE_ADD_SM100, code.to_string());
 }
 
+int TaskRegister::register_sum_of_squares_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // V4 mHC prenorm-GEMM v1 (decomposed, naive — see hc.md §1.7).
+  //
+  // Inputs:
+  //   residual_row [BATCH_SIZE, REDUCTION_SIZE] bf16 (partitioned row-wise)
+  //   fn           [OUTPUT_SIZE,  REDUCTION_SIZE] bf16 (broadcast)
+  // Outputs:
+  //   gemm_out_mul     [BATCH_SIZE, OUTPUT_SIZE] bf16 (partitioned row-wise)
+  //   gemm_out_sqrsum  [BATCH_SIZE]              fp32 (partitioned row-wise)
+  //
+  // The TB-graph dispatches one task per row of the residual. Each task sees
+  // a single residual row, the whole fn matrix (broadcast), and writes its
+  // single (mul_row, sqrsum_scalar) pair. The kernel itself is blockIdx-
+  // agnostic — it reads `task_desc->input_ptrs[]` / `output_ptrs[]` only.
+  assert(params.size() == 0);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 2;
+  int num_outputs = 2;
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  assert(input_ops[0]->output_tensors[0].num_dims == 2);
+  assert(input_ops[1]->output_tensors[0].num_dims == 2);
+  int reduction_size = input_ops[0]->output_tensors[0].dim[1];
+  int output_size = input_ops[1]->output_tensors[0].dim[0]; // hc3
+  int num_threads = bgraph.block_dim.x;
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::sum_of_squares_sm100_task_impl<cute::bfloat16_t, "
+         "cute::bfloat16_t, $, $, $>(",
+         /*OUTPUT_SIZE=*/output_size,
+         /*REDUCTION_SIZE=*/reduction_size,
+         /*NUM_THREADS=*/num_threads);
+  code.e("    task_desc->input_ptrs[0],");
+  code.e("    task_desc->input_ptrs[1],");
+  code.e("    task_desc->output_ptrs[0],");
+  code.e("    task_desc->output_ptrs[1]);");
+  return register_task_variant(TASK_SUM_OF_SQUARES_SM100, code.to_string());
+}
+
 int TaskRegister::register_softmax_gather_sm100_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
   assert(params.size() == 0);

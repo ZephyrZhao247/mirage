@@ -1880,6 +1880,104 @@ class PersistentKernel:
         self.kn_graph.customized([input_a, input_b, output], tb_graph)
         self.kn_graph.register_task(tb_graph, "elementwise_add_sm100")
 
+    def mhc_prenorm_gemm_layer(
+        self,
+        residual: DTensor,
+        fn: DTensor,
+        gemm_out_mul: DTensor,
+        gemm_out_sqrsum: DTensor,
+        n_splits: int = 1,
+    ) -> None:
+        """DeepSeek V4-Flash mHC pre-norm GEMM (decomposed v1, single naive task).
+
+        Computes, for an input residual ``[N, hc, H]`` bf16 and a weight
+        matrix ``fn`` ``[(2+hc)*hc, hc*H]`` (cast to bf16 at convert-time):
+
+        - ``gemm_out_mul[splits, N, hc3]``: the linear projection
+          ``residual_flat @ fn.T`` (``n_splits=1`` in v1 so the leading split
+          dim is 1 and may be elided).
+        - ``gemm_out_sqrsum[splits, N]`` fp32: per-row squared-sum of the
+          residual (the RMSNorm denominator consumed by ``mhc_pre_layer``).
+
+        Implementation strategy (v1): a single naive kernel
+        (``sum_of_squares_sm100_task_impl``, registered as the
+        ``sum_of_squares_sm100`` task) computes both outputs together. This
+        is what ``docs/mpk/deepseek_v4/hc.md`` § 1.7 prescribes as the v1
+        fallback — register-fp32 accumulation, no tcgen05, no warp-spec.
+        Rationale: the production ``hc3 = (2+hc)*hc = 24`` is too narrow for
+        ``linear_sm100`` (its MMA tile assumes N is a multiple of 64), so the
+        existing BF16 ``linear_layer`` cannot host the projection at the real
+        contract.
+
+        The TaskType slot ``TASK_MHC_PRENORM_GEMM_SM100 = 298`` is reserved
+        for a v2 fused TF32 CUTLASS port; v1 uses ``TASK_SUM_OF_SQUARES_SM100``
+        instead (the same task that will be reused by other pre-norm
+        primitives in the V4 build).
+
+        TODO (v2): keep ``fn`` in fp32 and emit a fused TF32 GEMM that
+        produces fp32 ``gemm_out_mul`` directly (matches the deep-gemm
+        reference). The v1 bf16 path here trades GEMM precision for kernel
+        simplicity.
+
+        Shape contract (v1):
+          - residual:        [N, hc * H] bf16 (caller flattens [N, hc, H] to
+                             2D before attach; the memory layout is identical
+                             since hc is the outer dim of the flattened K
+                             axis).
+          - fn:              [hc3, hc * H] bf16 (cast from fp32 at convert
+                             time; hc3 = (2 + hc) * hc = 24 at production
+                             dims).
+          - gemm_out_mul:    [N, hc3] bf16 (the [1, N, hc3] split-leading-dim
+                             view is implied by the test; v1 outputs bf16
+                             because the underlying kernel is bf16-bf16-bf16).
+          - gemm_out_sqrsum: [N] fp32 (the [1, N] split-leading-dim view is
+                             implied; v1 produces a single split).
+        """
+        assert n_splits == 1, (
+            "v1 only supports n_splits=1; split-K is a v2 feature")
+        assert residual.num_dims == 2, (
+            "mhc_prenorm_gemm_layer expects residual already flattened to "
+            f"[N, hc*H]; got num_dims={residual.num_dims}")
+        assert fn.num_dims == 2, (
+            "mhc_prenorm_gemm_layer expects fn of shape [hc3, hc*H]; "
+            f"got num_dims={fn.num_dims}")
+        assert gemm_out_mul.num_dims == 2, (
+            "mhc_prenorm_gemm_layer expects gemm_out_mul of shape [N, hc3]; "
+            f"got num_dims={gemm_out_mul.num_dims}")
+        assert gemm_out_sqrsum.num_dims == 1, (
+            "mhc_prenorm_gemm_layer expects gemm_out_sqrsum of shape [N]; "
+            f"got num_dims={gemm_out_sqrsum.num_dims}")
+
+        n_tokens = residual.dim(0)
+        reduction_size = residual.dim(1)
+        hc3 = fn.dim(0)
+        assert fn.dim(1) == reduction_size, (
+            f"fn last dim {fn.dim(1)} must match residual last dim "
+            f"{reduction_size}")
+        assert gemm_out_mul.dim(0) == n_tokens, (
+            f"gemm_out_mul.dim(0)={gemm_out_mul.dim(0)} must match "
+            f"residual.dim(0)={n_tokens}")
+        assert gemm_out_mul.dim(1) == hc3, (
+            f"gemm_out_mul.dim(1)={gemm_out_mul.dim(1)} must equal "
+            f"fn.dim(0)={hc3}")
+        assert gemm_out_sqrsum.dim(0) == n_tokens, (
+            f"gemm_out_sqrsum.dim(0)={gemm_out_sqrsum.dim(0)} must match "
+            f"residual.dim(0)={n_tokens}")
+
+        block_dim = (256, 1, 1) if self.target_cc >= 90 else (128, 1, 1)
+
+        # One CTA per token. The residual is partitioned row-wise; fn is
+        # broadcast across all tasks; gemm_out_mul/gemm_out_sqrsum are
+        # partitioned row-wise like the residual.
+        tb_graph = TBGraph(CyTBGraph((n_tokens, 1, 1), block_dim, 1, 64))
+        tb_graph.new_input(residual,        (0, -1, -1), -1, True)
+        tb_graph.new_input(fn,              (-1, -1, -1), -1, True)
+        tb_graph.new_input(gemm_out_mul,    (0, -1, -1), -1, True)
+        tb_graph.new_input(gemm_out_sqrsum, (0, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [residual, fn, gemm_out_mul, gemm_out_sqrsum], tb_graph)
+        self.kn_graph.register_task(tb_graph, "sum_of_squares_sm100")
+
     def silu_mul_linear_with_residual_layer(
         self,
         input: DTensor,

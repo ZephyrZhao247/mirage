@@ -194,6 +194,11 @@ enum TaskType {
   TASK_MTP_BUILD_EMBED_INPUT = 294,
   // MLA prefill TP=8: unabsorbed, TMA K/V, seq_len<=4096.
   TASK_MLA_PREFILL_TP8_SM100 = 295,
+  // Per-row sum-of-squares reducer used by the V4 mHC prenorm-GEMM decomposed
+  // v1 path. Note: the V4 plan reserves slots 298-311 for the fused Wave-2
+  // kernels (e.g. TASK_MHC_PRENORM_GEMM_SM100 = 298); we use a free pre-298
+  // slot here so the Wave-2 pre-allocation block remains intact.
+  TASK_SUM_OF_SQUARES_SM100 = 296,
   TASK_SM100_TASK_END = 298, // SM100 end placeholder, not a real task
   TASK_SCHD_TASKS = 200,
   TASK_SCHD_EVENTS = 201,
