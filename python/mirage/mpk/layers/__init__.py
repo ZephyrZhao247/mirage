@@ -71,6 +71,7 @@ from .rotary import RotaryEmbedding
 
 # Attention (plain decode + paged prefill/decode + multi-token extend; MLA / split-KV in follow-ups)
 from .attention.attention import Attention
+from .attention.inv_rope_fp8_quant_o import InvRopeFP8QuantO
 from .attention.mla_v4_q_kv_rmsnorm import MLAv4QKVRMSNorm
 from .attention.paged_attention import PagedAttention
 from .attention.single_batch_extend_attention import SingleBatchExtendAttention
@@ -196,6 +197,7 @@ __all__ = [
     "RotaryEmbedding",
     # attention
     "Attention",
+    "InvRopeFP8QuantO",
     "MLAv4QKVRMSNorm",
     "PagedAttention",
     "SingleBatchExtendAttention",

@@ -5092,5 +5092,93 @@ int TaskRegister::register_hash_route_lookup_sm100_task(
   return register_task_variant(TASK_HASH_ROUTE_LOOKUP_SM100, code.to_string());
 }
 
+int TaskRegister::register_inv_rope_fp8_quant_o_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // V4-Flash MLA post-attention fused inverse-RoPE + per-block FP8 quant.
+  //
+  // Inputs:
+  //   o             [T, H, HEAD_DIM]              bf16 (broadcast — kernel
+  //                                                     addresses via
+  //                                                     token_offset)
+  //   cos_sin_cache [max_pos, ROPE_DIM]           bf16 (broadcast)
+  //   positions     [T]                           int32 (broadcast)
+  // Outputs:
+  //   o_fp8   [T, H, HEAD_DIM]                    fp8_e4m3fn (uint8)
+  //   o_scale [T, H, HEAD_DIM / BLOCK_SIZE]       fp32
+  //
+  // params[0] = BLOCK_SIZE (default 128 when omitted).
+  // num_tokens_per_task is fixed to 1 in v1 (one CTA per token).
+  int block_size = 128;
+  if (params.size() >= 1) {
+    block_size = params[0];
+  }
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int const num_inputs = 3;
+  int const num_outputs = 2;
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  // input_ops[0] = o             [T, H, HEAD_DIM]   bf16
+  // input_ops[1] = cos_sin_cache [max_pos, ROPE_DIM] bf16
+  // input_ops[2] = positions     [T]                 int32
+  // output_ops[0] = o_fp8   [T, H, HEAD_DIM]                fp8 (uint8)
+  // output_ops[1] = o_scale [T, H, HEAD_DIM / BLOCK_SIZE]   fp32
+  assert(input_ops[0]->dtensor.num_dims == 3);
+  assert(input_ops[1]->dtensor.num_dims == 2);
+  assert(input_ops[2]->dtensor.num_dims == 1);
+
+  int num_tokens_total = input_ops[0]->dtensor.dim[0];
+  int num_heads = input_ops[0]->dtensor.dim[1];
+  int head_dim = input_ops[0]->dtensor.dim[2];
+  int rope_dim = input_ops[1]->dtensor.dim[1];
+
+  assert(input_ops[2]->dtensor.dim[0] == num_tokens_total);
+
+  int num_scale_blocks = head_dim / block_size;
+  assert(head_dim % block_size == 0);
+  assert(rope_dim % 2 == 0);
+
+  assert(output_ops[0]->dtensor.num_dims == 3);
+  assert(output_ops[0]->dtensor.dim[0] == num_tokens_total);
+  assert(output_ops[0]->dtensor.dim[1] == num_heads);
+  assert(output_ops[0]->dtensor.dim[2] == head_dim);
+  assert(output_ops[1]->dtensor.num_dims == 3);
+  assert(output_ops[1]->dtensor.dim[0] == num_tokens_total);
+  assert(output_ops[1]->dtensor.dim[1] == num_heads);
+  assert(output_ops[1]->dtensor.dim[2] == num_scale_blocks);
+
+  // Use 32 threads (one warp) per CTA; the warp shuffle reduction in the
+  // kernel uses NUM_THREADS=32 lanes.
+  int const num_threads = 32;
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e(
+      "kernel::inv_rope_fp8_quant_o_task_impl<$, $, $, $, $, bfloat16, "
+      "bfloat16>(",
+      num_heads,
+      head_dim,
+      rope_dim,
+      block_size,
+      num_threads);
+  code.e("    task_desc->input_ptrs[0],");  // o
+  code.e("    task_desc->input_ptrs[1],");  // cos_sin_cache
+  code.e("    task_desc->input_ptrs[2],");  // positions
+  code.e("    task_desc->output_ptrs[0],"); // o_fp8
+  code.e("    task_desc->output_ptrs[1],"); // o_scale
+  code.e("    task_desc->task_metadata.token_offset,");
+  code.e("    1,"); // num_tokens_per_task = 1 (v1: one CTA per token)
+  code.e("    $);", num_tokens_total);
+  return register_task_variant(TASK_INV_ROPE_FP8_QUANT_O_SM100,
+                               code.to_string());
+}
+
 } // namespace runtime
 } // namespace mirage
