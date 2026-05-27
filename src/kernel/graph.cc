@@ -844,6 +844,13 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     // 4 inputs (q_in, kv_in, q_weight, kv_weight), 2 outputs (q_out, kv_out)
     task_config[op] = std::make_tuple(
         4, 2, TASK_MLA_V4_Q_KV_RMSNORM_SM100, variant_id);
+  } else if (name == "mla_v4_prefill_gather_sm100") {
+    int variant_id = task_register->register_mla_v4_prefill_gather_sm100_task(
+        customized->bgraph, params);
+    // 1 input (swa_cache), 1 output (gathered_kv). The paged_kv_* meta-
+    // tensors are read from runtime_config inside the generated code.
+    task_config[op] = std::make_tuple(
+        1, 1, TASK_MLA_V4_PREFILL_GATHER_SM100, variant_id);
   }
   // MTP tasks
   else if (name == "mtp_verify_strict") {

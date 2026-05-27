@@ -5092,6 +5092,80 @@ int TaskRegister::register_hash_route_lookup_sm100_task(
   return register_task_variant(TASK_HASH_ROUTE_LOOKUP_SM100, code.to_string());
 }
 
+int TaskRegister::register_mla_v4_prefill_gather_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // V4-Flash MLA prefill KV gather. v1: SWA-only paged-to-contiguous copy.
+  //
+  // Inputs:
+  //   swa_cache         [num_pages, PAGE_SIZE, HEAD_DIM] bf16 (broadcast)
+  // Outputs:
+  //   gathered_kv       [T_kv_max, HEAD_DIM] bf16 (broadcast — kernel
+  //                                              addresses its row via
+  //                                              task_metadata.token_offset)
+  //
+  // paged_kv_indices_buffer / paged_kv_indptr_buffer /
+  // paged_kv_last_page_len_buffer are read from runtime_config (the MPK
+  // meta-tensors), matching the V3 mla_kv_gather_sm100 convention.
+  //
+  // params:
+  //   params[0] = HEAD_DIM   (inferred from output tensor when omitted)
+  //   params[1] = PAGE_SIZE  (default 64 when omitted)
+  int const num_inputs = 1;
+  int const num_outputs = 1;
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  // input_ops[0] = swa_cache       [num_pages, PAGE_SIZE, HEAD_DIM]   bf16
+  // output_ops[0] = gathered_kv    [T_kv_max, HEAD_DIM]               bf16
+  assert(input_ops[0]->dtensor.num_dims == 3);
+  assert(output_ops[0]->dtensor.num_dims == 2);
+
+  int page_size_inferred = input_ops[0]->dtensor.dim[1];
+  int head_dim_inferred = input_ops[0]->dtensor.dim[2];
+  int num_tokens_total = output_ops[0]->dtensor.dim[0];
+  assert(output_ops[0]->dtensor.dim[1] == head_dim_inferred);
+
+  int head_dim = head_dim_inferred;
+  int page_size = page_size_inferred;
+  if (params.size() >= 1) {
+    head_dim = params[0];
+    assert(head_dim == head_dim_inferred);
+  }
+  if (params.size() >= 2) {
+    page_size = params[1];
+    assert(page_size == page_size_inferred);
+  }
+
+  // 128 threads/CTA — matches the V3 MLA gather. One CTA copies one KV row.
+  int const num_threads = 128;
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e(
+      "kernel::mla_v4_prefill_gather_sm100_task_impl<$, $, $>(",
+      head_dim,
+      page_size,
+      num_threads);
+  code.e("    task_desc->input_ptrs[0],");  // swa_cache
+  code.e("    runtime_config.paged_kv_indices_buffer,");
+  code.e("    runtime_config.paged_kv_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_last_page_len_buffer,");
+  code.e("    task_desc->output_ptrs[0],"); // gathered_kv
+  code.e("    task_desc->task_metadata.token_offset,");
+  code.e("    1,"); // num_tokens_per_task = 1 (v1: one CTA per KV row)
+  code.e("    $);", num_tokens_total);
+  return register_task_variant(TASK_MLA_V4_PREFILL_GATHER_SM100,
+                               code.to_string());
+}
+
 int TaskRegister::register_inv_rope_fp8_quant_o_sm100_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
   // V4-Flash MLA post-attention fused inverse-RoPE + per-block FP8 quant.
