@@ -5455,5 +5455,111 @@ int TaskRegister::register_mla_v4_decode_sm100_task(
   return register_task_variant(TASK_MLA_V4_DECODE_SM100, code.to_string());
 }
 
+int TaskRegister::register_compressor_compress_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // V4-Flash Compressor compress step (Wave-2 sub-batch C2).
+  //
+  // Inputs:
+  //   state_cache    [B, WINDOW, 2 * HEAD_DIM]    bf16
+  //   ape            [COMPRESS_RATIO, HEAD_DIM]   bf16
+  //   cos_sin_cache  [max_pos, ROPE_DIM]          bf16
+  //   norm_weight    [HEAD_DIM]                   bf16
+  //   positions      [T]                          int32
+  // Outputs:
+  //   kv_cache       [num_compressed_slots, slot_bytes]  uint8
+  //
+  // params layout (5 ints):
+  //   params[0] = HEAD_DIM                 (template int)
+  //   params[1] = ROPE_DIM                 (template int)
+  //   params[2] = COMPRESS_RATIO           (template int)
+  //   params[3] = OVERLAP                  (0 / 1; template bool)
+  //   params[4] = BLOCK_SIZE               (FP8 quant block width)
+  //   params[5] = eps fp32 bits            (memcpy decode)
+  //   params[6] = kv_cache_token_stride_bytes  (0 ⇒ default slot bytes)
+  assert(params.size() == 7);
+  int head_dim = params[0];
+  int rope_dim = params[1];
+  int compress_ratio = params[2];
+  int overlap = params[3];
+  int block_size = params[4];
+  float eps = 0.f;
+  memcpy(&eps, &params[5], sizeof(float));
+  int kv_cache_token_stride_bytes = params[6];
+
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int const num_inputs = 5;
+  int const num_outputs = 1;
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+
+  // Light validation against the template parameters declared in `params`.
+  // state_cache: [B, WINDOW, 2*HEAD_DIM]
+  assert(input_ops[0]->dtensor.num_dims == 3);
+  // The trailing axis must equal 2*HEAD_DIM.
+  assert(input_ops[0]->dtensor.dim[2] == 2 * head_dim);
+  // ape: [COMPRESS_RATIO, HEAD_DIM]
+  assert(input_ops[1]->dtensor.num_dims == 2);
+  assert(input_ops[1]->dtensor.dim[0] == compress_ratio);
+  assert(input_ops[1]->dtensor.dim[1] == head_dim);
+  // cos_sin_cache: [max_pos, ROPE_DIM]
+  assert(input_ops[2]->dtensor.num_dims == 2);
+  assert(input_ops[2]->dtensor.dim[1] == rope_dim);
+  // norm_weight: [HEAD_DIM]
+  assert(input_ops[3]->dtensor.num_dims == 1);
+  assert(input_ops[3]->dtensor.dim[0] == head_dim);
+  // positions: [T]
+  assert(input_ops[4]->dtensor.num_dims == 1);
+  int num_tokens_total = input_ops[4]->dtensor.dim[0];
+  // kv_cache: 2-D uint8 slab [num_compressed_slots, slot_bytes] in v1.
+  assert(output_ops[0]->dtensor.num_dims == 2 ||
+         output_ops[0]->dtensor.num_dims == 1);
+
+  // Threads: match the established Blackwell convention (256). Fall back
+  // when HEAD_DIM is smaller than the warp count we'd need.
+  int num_threads = 256;
+  if (head_dim < 128) {
+    num_threads = 128;
+  }
+  if (head_dim < 64) {
+    num_threads = 64;
+  }
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e(
+      "kernel::compressor_compress_task_impl<$, $, $, $, $, $>(",
+      head_dim,
+      rope_dim,
+      compress_ratio,
+      overlap ? std::string("true") : std::string("false"),
+      block_size,
+      num_threads);
+  code.e("    task_desc->input_ptrs[0],");  // state_cache
+  code.e("    task_desc->input_ptrs[1],");  // ape
+  code.e("    task_desc->input_ptrs[2],");  // cos_sin_cache
+  code.e("    task_desc->input_ptrs[3],");  // norm_weight
+  code.e("    task_desc->input_ptrs[4],");  // positions
+  code.e("    task_desc->output_ptrs[0],"); // kv_cache (uint8 paged)
+  code.e("    task_desc->task_metadata.token_offset,");
+  code.e("    1,"); // num_tokens_per_task = 1
+  code.e("    $,", num_tokens_total);
+  // batch_offset is 0 in v1 — the kernel addresses state_cache[t] where
+  // t == token_offset. Plumbed via the same field so a v2 multi-batch
+  // path can set it explicitly without re-codegen.
+  code.e("    0,");
+  code.e("    $,", kv_cache_token_stride_bytes);
+  code.e("    $f);", eps);
+  return register_task_variant(TASK_COMPRESSOR_COMPRESS_SM100,
+                               code.to_string());
+}
+
 } // namespace runtime
 } // namespace mirage
