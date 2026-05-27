@@ -57,6 +57,7 @@
 #include "mla_v4_prefill_gather_sm100.cuh"
 #include "mla_v4_prefill_sm100.cuh"
 #include "mla_v4_q_kv_rmsnorm_sm100.cuh"
+#include "mla_v4_swa_cache_write_sm100.cuh"
 #include "moe_linear_sm100.cuh"
 #include "mul_sum_add_sm100.cuh"
 #include "per_token_group_quantize_fp8.cuh"

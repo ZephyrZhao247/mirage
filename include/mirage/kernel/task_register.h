@@ -115,6 +115,8 @@ public:
                                    std::vector<int> const &params);
   int register_hash_route_lookup_sm100_task(threadblock::Graph const &bgraph,
                                             std::vector<int> const &params);
+  int register_mla_v4_swa_cache_write_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
   int register_inv_rope_fp8_quant_o_sm100_task(
       threadblock::Graph const &bgraph, std::vector<int> const &params);
   int register_compressor_state_update_sm100_task(

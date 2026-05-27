@@ -120,16 +120,56 @@ class HashRouteToExpertMajor(MPKModule):
 
     def compile(
         self,
-        expert_ids: DTensor,
-        routing_indices: DTensor,
+        expert_ids: Union[torch.Tensor, DTensor, None] = None,
+        routing_indices_buffer: Optional[torch.Tensor] = None,
         *,
         grid_dim: Optional[GridDim] = None,
         block_dim: Optional[BlockDim] = None,
     ) -> DTensor:
-        raise NotImplementedError(
-            "HashRouteToExpertMajor.compile() is a Wave-3.5 scaffold. "
-            "Wave 4 recommends folding the scatter into "
-            "moe_permute_sm100 (new ROUTING_LAYOUT template parameter) "
-            "rather than landing a standalone kernel. See module "
-            "docstring for the trade-offs."
-        )
+        """Python-side scatter (option B from the module docstring).
+
+        Rather than landing a CUDA kernel for the per-step
+        ``[T, K] -> [E_LOCAL, MBT]`` scatter, this implementation
+        simply attaches a precomputed expert-major buffer to the MPK
+        graph as a broadcast input. The host (caller) is responsible
+        for materialising the buffer each step before invoking ``pk()``.
+
+        Args:
+          expert_ids: ignored at compile time (the scatter result is
+                      computed Python-side per step). Accepted for
+                      signature parity with the kernel-fold option (a).
+          routing_indices_buffer:
+              ``[E_LOCAL, MBT]`` int32 torch.Tensor (CUDA). The caller
+              owns this buffer and writes the scatter result into it
+              each step. ``compile()`` attaches it as an MPK input named
+              ``{prefix}routing_indices`` and returns its DTensor.
+
+        Returns: ``DTensor`` for the attached routing-indices buffer.
+        """
+        from ... import context as _ctx
+
+        if routing_indices_buffer is None:
+            raise ValueError(
+                "HashRouteToExpertMajor.compile() requires a "
+                "routing_indices_buffer torch.Tensor [E_LOCAL, MBT] int32 "
+                "(Python-side scatter strategy)."
+            )
+        if not isinstance(routing_indices_buffer, torch.Tensor):
+            raise TypeError(
+                "routing_indices_buffer must be a torch.Tensor; got "
+                f"{type(routing_indices_buffer).__name__}"
+            )
+        if routing_indices_buffer.dtype != torch.int32:
+            raise ValueError(
+                f"routing_indices_buffer must be int32; got "
+                f"{routing_indices_buffer.dtype}"
+            )
+        if routing_indices_buffer.dim() != 2:
+            raise ValueError(
+                "routing_indices_buffer must be 2-D [E_LOCAL, MBT]; got "
+                f"shape {tuple(routing_indices_buffer.shape)}"
+            )
+
+        pk = _ctx.current_pk()
+        prefix = self.prefix or "hash_route_to_expert_major_"
+        return pk.attach_input(routing_indices_buffer, name=f"{prefix}routing_indices")

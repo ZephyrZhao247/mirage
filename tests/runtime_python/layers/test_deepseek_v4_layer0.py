@@ -138,45 +138,130 @@ def test_reference_forward_with_real_weights():
 def test_compiled_vs_reference_layer0():
     """Compiled vs PyTorch-reference comparison for DeepseekV4Block L0.
 
-    Wave 3.5 status (follow-up to 83c38ecc):
+    Wave 3.6 status (follow-up to b466286d):
 
-      * Gap 4 (FP8 QAT on K/V nope dims): FIXED in the PyTorch reference.
-      * Gap 2 (grouped FP8 BMM for wo_a): identified -- existing
-        ``LinearFP8BMM`` matches the contract; no new code needed.
-      * Gap 3 (hash routing layout): adapter
-        ``HashRouteToExpertMajor`` landed (Python reference); kernel-
-        side fold OPEN for next wave.
-      * Gap 1 (SWA cache write-back): Python catalog scaffold landed
-        (``MLAv4SWACacheWrite``) and TaskType slot 364 reserved in
-        ``runtime_header.h``. The CUDA kernel itself + the
-        ``register_mla_v4_swa_cache_write_sm100_task`` entry in
-        ``src/kernel/task_register.cc`` are NOT landed -- the next
-        agent's first task.
+      * Gap 1 (SWA cache write-back): LANDED. The
+        ``mla_v4_swa_cache_write_sm100`` CUDA kernel + Python catalog
+        ``compile()`` are wired; ``test_mla_v4_swa_cache_write.py``
+        PASSES exact-copy against the PyTorch reference.
+      * Gap 3 (hash-route adapter): LANDED as Python-side scatter
+        (option B): caller materialises the expert-major routing buffer
+        each step and ``HashRouteToExpertMajor.compile`` attaches it as
+        a broadcast MPK input.
+      * Gap 4 (FP8 QAT round-trip): the catalog ``QuantizeFP8`` needs to
+        grow a round-trip (quant + immediate bf16 dequant) mode before
+        it can be inserted between ``MLAv4QKVRMSNorm`` and
+        ``MLAv4Decode``. STILL NOT WIRED.
+      * Gap 2 (LinearFP8BMM for wo_a): identified-only; not yet wired
+        into the block ``compile``.
 
-    Because Gap 1's kernel is missing AND the compile body itself is not
-    yet wired end-to-end, this test still raises ``SkipTest`` rather
-    than fake-passing. The skip reason below explicitly enumerates the
-    remaining work so the next agent can pick up from a known state.
+    ``DeepseekV4Block.compile()`` therefore still raises
+    ``NotImplementedError`` -- but it is no longer a Wave-3.5 SKIP. This
+    test un-skips and reports the missing piece as a FAILURE so the
+    next agent picks up from an honest, known state.
 
-    To un-skip in Wave 4:
-      1. Land ``tasks/blackwell/mla_v4_swa_cache_write_sm100.cuh`` +
-         ``register_mla_v4_swa_cache_write_sm100_task`` in
-         task_register.cc + dispatcher in graph.cc.
-      2. Implement ``DeepseekV4Block.compile()`` per the docstring (the
-         method comment-block describes the call sequence).
-      3. Remove the ``raise SkipTest`` below and run the body.
+    To make this test PASS:
+      1. Extend ``QuantizeFP8`` to support round-trip mode for gap 4.
+      2. Implement ``DeepseekV4Block.compile()`` per the ~20-step
+         sequence enumerated in its method-body comment.
+      3. Add bottom-up sub-module compile-vs-reference unit tests for
+         wq_a/wq_b/wkv FP8, MLA decode with new SWA write/gather, FP8
+         MoE pipeline with hash routing inputs, and HC pre/post.
+      4. Stitch them together once each piece is green.
     """
-    import unittest
-    raise unittest.SkipTest(
-        "DeepseekV4Block.compile() Wave 3.5 partial. Remaining: "
-        "(a) mla_v4_swa_cache_write_sm100 CUDA kernel (TaskType slot "
-        "364 reserved, Python scaffold at "
-        "python/mirage/mpk/layers/attention/mla_v4_swa_cache_write.py); "
-        "(b) DeepseekV4Block.compile() end-to-end wiring per its "
-        "docstring (LinearFP8BMM compose for wo_a, HashRouteToExpertMajor "
-        "for routing, QuantizeFP8(block=64) for K/V QAT, plus the "
-        "existing V3 MoE pipeline)."
+    print("\n" + "=" * 60)
+    print("DeepSeek V4-Flash Layer 0 — compiled vs reference")
+    print("=" * 60)
+
+    from mirage.mpk.models.deepseek_v4.block import DeepseekV4Block
+    from demo.deepseek_v4.models.convert import load_layer0_weights
+
+    config = _load_config()
+    layer = DeepseekV4Block(config, layer_idx=0)
+    print("[load] Reading Layer 0 weights ...")
+    consumed, unmapped = load_layer0_weights(CHECKPOINT_DIR, layer)
+    print(f"  consumed={len(consumed)} unmapped={len(unmapped)}")
+
+    device = "cuda"
+    layer = layer.to(device)
+    layer.eval()
+
+    T = 4
+    H = layer.hidden_size
+    hc = layer.hc_mult
+
+    torch.manual_seed(123)
+    hidden_hc = (
+        torch.randn(T, hc, H, dtype=torch.bfloat16, device=device) * 0.02
     )
+    position_ids = torch.arange(T, dtype=torch.int32, device=device)
+    swa_total = max(layer.sliding_window, T + 1)
+    swa_cache = torch.zeros(
+        swa_total, layer.head_dim, dtype=torch.bfloat16, device=device
+    )
+    input_ids = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device=device)
+
+    with torch.no_grad():
+        ref = layer.forward(hidden_hc, position_ids, swa_cache, input_ids)
+    print(f"  ref out.shape={tuple(ref.shape)} dtype={ref.dtype}")
+
+    # Attempt the MPK compile path. Wave 3.6 leaves this raising
+    # NotImplementedError -- we report that as a FAILURE (not a SKIP).
+    import mirage
+    from mirage.mpk.persistent_kernel import PersistentKernel
+    num_workers, num_schedulers = mirage.get_configurations_from_gpu(0)
+    params = PersistentKernel.get_default_init_parameters()
+    params["test_mode"] = True
+    params["num_workers"] = num_workers
+    params["num_local_schedulers"] = num_schedulers
+    params["mpi_rank"] = 0
+    params["world_size"] = 1
+    params["max_num_batched_tokens"] = T
+    params["max_num_batched_requests"] = T
+    pk = PersistentKernel(**params)
+
+    hidden_hc_dt = pk.attach_input(hidden_hc, name="hidden_hc")
+    position_ids_dt = pk.attach_input(position_ids, name="position_ids")
+    swa_cache_dt = pk.attach_input(swa_cache, name="swa_cache")
+    input_ids_dt = pk.attach_input(
+        input_ids.to(torch.int32), name="input_ids"
+    )
+
+    failure_module = "DeepseekV4Block.compile (NOT_IMPLEMENTED)"
+    failure_msg = None
+    try:
+        with pk.compile_scope():
+            layer.compile(
+                hidden_hc_dt, position_ids_dt, swa_cache_dt, input_ids_dt,
+            )
+    except NotImplementedError as exc:
+        failure_msg = str(exc)
+    except Exception as exc:
+        failure_module = type(exc).__name__
+        failure_msg = str(exc)
+
+    if failure_msg is None:
+        # We got past compile() -- run the kernel and compare.
+        pk.compile(output_dir=os.path.dirname(__file__))
+        pk()
+        torch.cuda.synchronize()
+        # The compile output buffer name is TBD once compile() is fully
+        # implemented. Until then this branch is unreachable.
+        raise RuntimeError(
+            "compile() unexpectedly succeeded without producing an "
+            "output DTensor; update this test to fetch the result and "
+            "run torch.testing.assert_close(out_mpk, ref, atol=5e-2, "
+            "rtol=5e-2)."
+        )
+    else:
+        # Report honest failure -- NOT a SkipTest.
+        msg = (
+            f"\nFAILED: diverging module = {failure_module}\n"
+            f"  detail: {failure_msg}\n"
+            f"  max-abs-diff vs reference: N/A (compile path not built)\n"
+        )
+        print(msg)
+        raise AssertionError(msg)
 
 
 if __name__ == "__main__":
@@ -194,9 +279,20 @@ if __name__ == "__main__":
         print(f"\nFAILED: {exc}")
         sys.exit(1)
 
-    # Print the SKIP marker without raising it standalone.
+    # Wave 3.6: un-SKIPPED. Now runs and reports honest failure when
+    # DeepseekV4Block.compile() raises NotImplementedError.
     print("\n" + "=" * 60)
-    print("[SKIP] test_compiled_vs_reference_layer0 — Wave 3.5 partial; "
-          "see test docstring for remaining items (SWA cache write "
-          "kernel + compile() wiring).")
+    try:
+        test_compiled_vs_reference_layer0()
+    except AssertionError as exc:
+        # Honest failure -- not a SKIP. Print and exit non-zero so the
+        # test driver records it as FAIL.
+        print(f"\n[FAIL] test_compiled_vs_reference_layer0:")
+        print(str(exc))
+        sys.exit(1)
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        print(f"\n[FAIL] test_compiled_vs_reference_layer0 (unexpected): {exc}")
+        sys.exit(1)
     print("=" * 60)

@@ -861,7 +861,7 @@ class DeepseekV4Block(MPKModule):
         return (y.to(x.dtype) + shared).to(x.dtype)
 
     # ==================================================================
-    # MPK compile() — Wave-3.5 best-effort scaffold
+    # MPK compile() — Wave-3.6 status
     # ==================================================================
     def compile(
         self,
@@ -874,52 +874,118 @@ class DeepseekV4Block(MPKModule):
         grid_dim=None,
         block_dim=None,
     ):
-        """Best-effort MPK composition of the V4 catalog modules.
+        """MPK composition of the V4 catalog modules.
 
-        Wave 3.5 status (follow-up to 83c38ecc):
+        Wave 3.6 status (follow-up to b466286d):
 
-        * Gap 4 (FP8 QAT on K/V nope dims): FIXED in the PyTorch
-          reference ``forward()``. The MPK compile path needs to insert
-          ``QuantizeFP8(block_size=64)`` followed by an in-place dequant
-          before the ``MLAv4Decode`` consumes K/V; the catalog module
-          exists at ``python/mirage/mpk/layers/quantize_fp8.py``. Not yet
-          wired here.
+        * Gap 1 (SWA cache write-back): LANDED. The
+          ``mla_v4_swa_cache_write_sm100`` CUDA kernel + Python catalog
+          ``compile()`` are wired (this PR). Test
+          ``tests/runtime_python/layers/test_mla_v4_swa_cache_write.py``
+          PASSES exact-copy against the PyTorch reference.
+
+        * Gap 3 (hash routing -> MoE permute layout): LANDED as the
+          Python-side scatter (option B in
+          ``hash_route_to_expert_major.py``): caller materialises the
+          expert-major routing buffer each step on the host/GPU and
+          attaches it as a broadcast MPK input.
+
+        * Gap 4 (FP8 QAT on K/V nope dims, block=64): FIXED in the
+          PyTorch reference ``forward()`` via ``_fp8_qat_inplace``. The
+          MPK compile path needs ``QuantizeFP8(block_size=64)`` +
+          immediate dequant inserted between ``MLAv4QKVRMSNorm`` and
+          ``MLAv4Decode``. STILL NOT WIRED here -- needs the catalog
+          ``quantize_fp8.QuantizeFP8`` to grow a "round-trip" mode that
+          re-dequants in-place (current behavior leaves the output as
+          fp8_e4m3fn + a scale buffer, which the downstream MLA decode
+          does not accept).
 
         * Gap 2 (grouped FP8 BMM for wo_a): the existing
-          ``LinearFP8BMM`` catalog matches the V4 wo_a shape contract
-          exactly --
-          ``[T, groups, per_group] @ [groups, o_lora, per_group]^T
-          -> [T, groups, o_lora]``. Wave 4 should compose this directly
-          (no new kernel required); ``num_heads = o_groups``,
-          ``in_features_per_head = num_heads * head_dim / o_groups``,
-          ``out_features_per_head = o_lora_rank``.
+          ``LinearFP8BMM`` catalog matches the V4 wo_a shape contract.
+          Wave 4 should compose this directly.
 
-        * Gap 3 (hash routing vs V3 MoE permute): ``HashRouteLookup``
-          outputs ``[T, K]`` int32 token-major; ``MoEPermute`` wants
-          ``[E_LOCAL, MBT]`` int32 expert-major + 1-indexed. See
-          ``python/mirage/mpk/layers/moe/hash_route_to_expert_major.py``
-          for the adapter (Python reference today, kernel-fold OPEN).
+        End-to-end wiring of the remaining V4 block forward (HC prenorm
+        + pre, MLA decode with the new SWA write/gather flow, FP8 MoE
+        with hash routing, HC post) requires ~20 catalog calls in a
+        precise sequence. The orchestration is intricate enough that
+        landing it as a single change would risk silent miscompiles
+        (FP8 dequant scaling, grouped BMM strides, MoE permute /
+        unpermute index contracts, RoPE per-token apply between two FP8
+        GEMMs, etc.). A worked-in-pieces approach (bottom-up bisection
+        against the reference, sub-module-by-sub-module) is the only
+        path to a correct compiled vs reference comparison.
 
-        * Gap 1 (SWA cache write-back): catalog scaffold landed at
-          ``python/mirage/mpk/layers/attention/mla_v4_swa_cache_write.py``
-          with reserved ``TaskType TASK_MLA_V4_SWA_CACHE_WRITE_SM100=364``
-          in ``runtime_header.h``. The CUDA kernel and ``task_register.cc``
-          entry are NOT landed -- next agent's first task.
-
-        Until all four gaps are wired into a single contiguous
-        compile-scope block, this method raises
-        :class:`NotImplementedError`. The companion test
-        ``test_compiled_vs_reference_layer0`` remains SKIP with the
-        precise outstanding-work description.
+        The method body below documents the call sequence at a high
+        level and raises ``NotImplementedError`` with a precise pointer
+        to the first missing piece (the FP8 QAT round-trip catalog
+        update). The companion test
+        ``test_compiled_vs_reference_layer0`` un-skips and reports this
+        error as a FAILURE (not a SKIP), so the next agent picks up
+        from a known, honest state.
         """
+        # --- Sketch of the call sequence (Wave-3.6 documentation only) ---
+        # The intent is:
+        #   1. mhc_prenorm_gemm_attn.compile(hidden_hc, hc_attn_fn)
+        #        -> mixes_attn [T, mix_hc]
+        #   2. mhc_pre_attn.compile(hidden_hc, mixes_attn, hc_attn_scale,
+        #                           hc_attn_base) -> layer_input [T, H]
+        #        (this also internally produces the `pre`, `post`, `comb`
+        #        coefficients on the device and stages `comb*residual` for
+        #        the matching `mhc_post_attn`).
+        #   3. LinearFP8(wq_a).compile(layer_input) -> q_lora [T, q_lora]
+        #   4. MLAv4QKVRMSNorm.compile(q_lora, kv_unproj) -> {q_lora_norm,
+        #                                                     kv_norm}
+        #      (kv_unproj comes from a parallel LinearFP8(wkv).compile()).
+        #   5. RoPE apply on the rope-tail of q (per-token).
+        #   6. LinearFP8(wq_b).compile(q_lora_norm) -> q [T, H, head_dim]
+        #   7. QuantizeFP8(block=64, roundtrip=True).compile(kv_norm[..., :-rd])
+        #      -- gap 4 placeholder; needs catalog update.
+        #   8. MLAv4SWACacheWrite.compile(kv_norm, position_ids, swa_cache)
+        #   9. MLAv4Decode.compile(q, swa_cache, attn_sink) -> attn_out
+        #  10. InvRopeFP8QuantO.compile(attn_out, cos_sin, position_ids)
+        #        -> o_fp8, o_scale
+        #  11. LinearFP8BMM(o_groups, o_lora_rank).compile(o_fp8, wo_a)
+        #        -> wo_a_out [T, groups, o_lora]
+        #  12. LinearFP8(wo_b).compile(wo_a_out_flat) -> attn_proj [T, H]
+        #  13. mhc_post_attn.compile(attn_proj, residual, comb, post)
+        #        -> hidden_hc_attn [T, hc, H]
+        #  14. mhc_prenorm_gemm_ffn + mhc_pre_ffn  (same shape as 1+2 above)
+        #        -> ffn_in [T, H]
+        #  15. HashRouteLookup.compile(input_ids)
+        #        -> expert_ids [T, K], topk_weights [T, K]
+        #      Python-side caller computes weights, then materialises
+        #      expert-major routing_indices and supplies it via
+        #      HashRouteToExpertMajor.compile(routing_indices_buffer=...).
+        #  16. QuantizeFP8.compile(ffn_in) -> ffn_in_fp8, scale
+        #  17. MoEPermute.compile(ffn_in_fp8, scale, routing_indices)
+        #        -> permuted_in_fp8, permuted_scale, num_active
+        #  18. MoEW13FP8.compile(...) -> w13_out [..., 2*I]
+        #  19. SiluMul(swiglu_limit=10).compile(w13_out) -> mid [..., I]
+        #  20. MoEW2FP8.compile(mid) -> w2_out
+        #  21. MoEUnpermute.compile(w2_out, ...) -> routed_y
+        #  22. Shared-expert path (parallel): LinearFP8(sw1) + LinearFP8(sw3)
+        #        -> gate_s, up_s; SiluMul (unclamped); LinearFP8(sw2)
+        #        -> shared
+        #  23. MoeMulSumAdd.compile(routed_y, weights, shared)
+        #        -> moe_out [T, H]
+        #  24. mhc_post_ffn.compile(moe_out, residual, comb, post)
+        #        -> hidden_hc_ffn [T, hc, H]  -- the block output.
         raise NotImplementedError(
-            "DeepseekV4Block.compile() is a Wave-3.5 scaffold. Wave-4 "
-            "must (a) wire LinearFP8BMM for wo_a, (b) land the new "
-            "mla_v4_swa_cache_write_sm100 CUDA kernel + task_register "
-            "entry, (c) wire HashRouteToExpertMajor (or fold into "
-            "MoEPermute), and (d) thread the FP8 QAT step (gap 4) into "
-            "the compile path between MLAv4QKVRMSNorm and MLAv4Decode. "
-            "See this method's docstring for per-gap detail."
+            "DeepseekV4Block.compile() Wave-3.6 partial. Gaps 1 (SWA "
+            "cache write) and 3 (hash-route adapter) are landed; gaps "
+            "2 (LinearFP8BMM for wo_a) and 4 (FP8 QAT round-trip on K/V "
+            "nope dims) still need their catalog wiring, and the full "
+            "~20-step orchestration of the block (HC + MLA + FP8 MoE) "
+            "needs to be assembled bottom-up with sub-module bisection "
+            "against the PyTorch reference. The required call sequence "
+            "is enumerated in the method body's comment. The next agent "
+            "should: (a) extend QuantizeFP8 to support a round-trip "
+            "(quant+dequant in bf16) mode for gap 4; (b) write per-sub-"
+            "module compiled-vs-reference unit tests for wq_a/wq_b/wkv "
+            "FP8 paths, MLAv4Decode integration with the new SWA write/"
+            "gather, the FP8 MoE pipeline with hash-route inputs, and "
+            "the HC pre/post sandwich; (c) assemble the full block once "
+            "each piece is green."
         )
 
     def auto_grid_dim(self, *args, **kwargs):

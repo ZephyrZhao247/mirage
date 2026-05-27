@@ -682,6 +682,15 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     // 2 inputs (input_ids, tid2eid), 2 outputs (expert_ids, topk_weights)
     task_config[op] =
         std::make_tuple(2, 2, TASK_HASH_ROUTE_LOOKUP_SM100, variant_id);
+  } else if (name == "mla_v4_swa_cache_write_sm100") {
+    int variant_id = task_register->register_mla_v4_swa_cache_write_sm100_task(
+        customized->bgraph, params);
+    // 2 or 3 inputs (kv_in, positions[, batch_ids]); 1 in-place output
+    // (swa_cache ring buffer).
+    int total_ops = (int)customized->bgraph.operators.size();
+    int n_in = total_ops - 1;
+    task_config[op] = std::make_tuple(
+        n_in, 1, TASK_MLA_V4_SWA_CACHE_WRITE_SM100, variant_id);
   } else if (name == "inv_rope_fp8_quant_o_sm100") {
     int variant_id = task_register->register_inv_rope_fp8_quant_o_sm100_task(
         customized->bgraph, params);

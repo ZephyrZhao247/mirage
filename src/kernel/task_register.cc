@@ -5183,6 +5183,100 @@ int TaskRegister::register_hash_route_lookup_sm100_task(
   return register_task_variant(TASK_HASH_ROUTE_LOOKUP_SM100, code.to_string());
 }
 
+int TaskRegister::register_mla_v4_swa_cache_write_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // V4-Flash MLA sliding-window cache write-back.
+  //
+  // Inputs:
+  //   kv_in     [T, HEAD_DIM]                bf16 (broadcast — kernel
+  //                                                addresses via token_offset)
+  //   positions [T]                          int32 (broadcast)
+  //   batch_ids [T] (optional)               int32 (broadcast)
+  // Outputs:
+  //   swa_cache [B, WINDOW_SIZE, HEAD_DIM]   bf16 (broadcast, in-place ring)
+  //
+  // params[0] = WINDOW_SIZE (inferred from swa_cache.dim(1) when omitted).
+  // num_tokens_per_task is fixed to 1 in v1 (one CTA per token).
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  // The Python catalog passes either (kv_in, positions) -> swa_cache (2 in,
+  // 1 out) or (kv_in, positions, batch_ids) -> swa_cache (3 in, 1 out).
+  // Accept both: the last input is treated as `batch_ids` if 3 are supplied;
+  // a null pointer is passed at runtime otherwise.
+  int total_ops = (int)bgraph.operators.size();
+  assert(total_ops == 3 || total_ops == 4);
+  int num_inputs = total_ops - 1;
+  int num_outputs = 1;
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  // input_ops[0] = kv_in     [T, HEAD_DIM]  bf16
+  // input_ops[1] = positions [T]            int32
+  // input_ops[2] = batch_ids [T]            int32 (optional)
+  // output_ops[0] = swa_cache [B, W, HEAD_DIM]  bf16
+  assert(input_ops[0]->dtensor.num_dims == 2);
+  assert(input_ops[1]->dtensor.num_dims == 1);
+  int num_tokens_total = input_ops[0]->dtensor.dim[0];
+  int head_dim = input_ops[0]->dtensor.dim[1];
+  assert(input_ops[1]->dtensor.dim[0] == num_tokens_total);
+  if (num_inputs == 3) {
+    assert(input_ops[2]->dtensor.num_dims == 1);
+    assert(input_ops[2]->dtensor.dim[0] == num_tokens_total);
+  }
+
+  // swa_cache may be presented as 2-D [W, HEAD_DIM] (B=1 flattened) or 3-D
+  // [B, W, HEAD_DIM]. Normalize.
+  int window_size_inferred = 0;
+  if (output_ops[0]->dtensor.num_dims == 2) {
+    window_size_inferred = output_ops[0]->dtensor.dim[0];
+    assert(output_ops[0]->dtensor.dim[1] == head_dim);
+  } else {
+    assert(output_ops[0]->dtensor.num_dims == 3);
+    window_size_inferred = output_ops[0]->dtensor.dim[1];
+    assert(output_ops[0]->dtensor.dim[2] == head_dim);
+  }
+  int window_size = window_size_inferred;
+  if (params.size() >= 1) {
+    window_size = params[0];
+    assert(window_size == window_size_inferred);
+  }
+
+  // 128 threads/CTA — head_dim is typically a multiple of NUM_THREADS*8.
+  int num_threads = 128;
+  if (head_dim < num_threads * 8) {
+    // Reduce so we still have at least one full uint4 stride per lane.
+    num_threads = head_dim / 8;
+    if (num_threads <= 0) {
+      num_threads = 8;
+    }
+  }
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::mla_v4_swa_cache_write_sm100_task_impl<$, $, $>(",
+         head_dim,
+         window_size,
+         num_threads);
+  code.e("    task_desc->input_ptrs[0],");                     // kv_in
+  code.e("    static_cast<int const*>(task_desc->input_ptrs[1]),");  // positions
+  if (num_inputs == 3) {
+    code.e("    static_cast<int const*>(task_desc->input_ptrs[2]),");  // batch_ids
+  } else {
+    code.e("    nullptr,");
+  }
+  code.e("    task_desc->output_ptrs[0],");  // swa_cache
+  code.e("    task_desc->task_metadata.token_offset,");
+  code.e("    1,");  // num_tokens_per_task
+  code.e("    $);", num_tokens_total);
+  return register_task_variant(TASK_MLA_V4_SWA_CACHE_WRITE_SM100,
+                               code.to_string());
+}
+
 int TaskRegister::register_mla_v4_prefill_gather_sm100_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
   // V4-Flash MLA prefill KV gather. v1: SWA-only paged-to-contiguous copy.

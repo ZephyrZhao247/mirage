@@ -446,6 +446,12 @@ void register_mugraph(
               task.task_metadata.token_offset = bid.x;
               task.task_metadata.num_tokens_per_task = 1;
             }
+            // DeepSeek V4-Flash MLA SWA cache write-back:
+            // grid=(num_tokens,), one CTA per token.
+            if (task_type == TASK_MLA_V4_SWA_CACHE_WRITE_SM100) {
+              task.task_metadata.token_offset = bid.x;
+              task.task_metadata.num_tokens_per_task = 1;
+            }
             // DeepSeek V4-Flash MLA pre-attention joint Q+KV RMSNorm:
             // grid=(num_tokens,), one CTA per token. token_offset = bid.x;
             // num_tokens_per_task = 1.
@@ -1900,6 +1906,8 @@ TaskGraphResult print_task_graph(
   task_type_to_name[TASK_MHC_HEAD_SM100] = "TASK_MHC_HEAD_SM100";
   task_type_to_name[TASK_HASH_ROUTE_LOOKUP_SM100] =
       "TASK_HASH_ROUTE_LOOKUP_SM100";
+  task_type_to_name[TASK_MLA_V4_SWA_CACHE_WRITE_SM100] =
+      "TASK_MLA_V4_SWA_CACHE_WRITE_SM100";
   task_type_to_name[TASK_MLA_V4_Q_KV_RMSNORM_SM100] =
       "TASK_MLA_V4_Q_KV_RMSNORM_SM100";
   task_type_to_name[TASK_MLA_V4_PREFILL_SM100] =

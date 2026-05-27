@@ -28,6 +28,8 @@ from typing import Optional, Union
 import torch
 import torch.nn as nn
 
+import mirage as mi
+
 from .._base import BlockDim, GridDim, MPKModule
 
 from ....core import DTensor
@@ -143,23 +145,62 @@ class MLAv4SWACacheWrite(MPKModule):
         grid_dim: Optional[GridDim] = None,
         block_dim: Optional[BlockDim] = None,
     ) -> DTensor:
-        """Register ``mla_v4_swa_cache_write_sm100``.
+        """Register one ``mla_v4_swa_cache_write_sm100`` task.
 
-        Wave 3.5 status: the CUDA kernel and C++ task_register entry are
-        NOT landed in this commit. Calling compile() raises
-        :class:`NotImplementedError` with a precise pointer to what is
-        missing. The Python catalog signature is fixed so that downstream
-        callers (``DeepseekV4Block.compile``) can be authored against it.
+        Tensor contract:
+          kv_in     : [T, HEAD_DIM]              bf16, the per-token K/V
+                      to write into the SWA ring.
+          positions : [T]                        int32, absolute positions.
+          swa_cache : [W, HEAD_DIM] or
+                      [B, W, HEAD_DIM]           bf16, in-place ring buffer.
+          batch_ids : [T] int32 or None          per-token batch index.
+
+        Grid is ``(T, 1, 1)`` with one CTA per token; ``token_offset``
+        comes from ``task_metadata``. Returns the ``swa_cache`` DTensor
+        (in-place write).
         """
-        raise NotImplementedError(
-            "MLAv4SWACacheWrite.compile() is a Wave-3.5 scaffold. "
-            "The supporting CUDA kernel "
-            "(tasks/blackwell/mla_v4_swa_cache_write_sm100.cuh) and "
-            "task_register entry "
-            "(register_mla_v4_swa_cache_write_sm100_task in "
-            "src/kernel/task_register.cc) plus the TaskType slot "
-            "TASK_MLA_V4_SWA_CACHE_WRITE_SM100 = 364 must land before "
-            "this catalog module can register a real task. See "
-            "docs/mpk/mpk_runtime_analysis.md for the kernel skeleton "
-            "template and DeepseekV4Block.compile for the call site."
-        )
+        from ... import context as _ctx
+        from ....core import CyTBGraph
+        from ....kernel import TBGraph
+
+        pk = _ctx.current_pk()
+        assert kv_in.num_dims == 2
+        T = kv_in.dim(0)
+        prefix = self.prefix or "mla_v4_swa_cache_write_"
+
+        def _attach(buf, name, expected_dtype_torch=None):
+            if isinstance(buf, torch.Tensor):
+                if expected_dtype_torch is not None and buf.dtype != expected_dtype_torch:
+                    raise ValueError(
+                        f"{name} must have dtype {expected_dtype_torch}; "
+                        f"got {buf.dtype}"
+                    )
+                return pk.attach_input(buf, name=name)
+            if isinstance(buf, DTensor):
+                return buf
+            raise TypeError(
+                f"{name} must be torch.Tensor or DTensor; got "
+                f"{type(buf).__name__}"
+            )
+
+        positions_dt = _attach(positions, f"{prefix}positions", torch.int32)
+        swa_cache_dt = _attach(swa_cache, f"{prefix}swa_cache", torch.bfloat16)
+
+        inputs = [kv_in, positions_dt]
+        if batch_ids is not None:
+            batch_ids_dt = _attach(batch_ids, f"{prefix}batch_ids", torch.int32)
+            inputs.append(batch_ids_dt)
+
+        if grid_dim is None:
+            grid_dim = self.auto_grid_dim(kv_in)
+        if block_dim is None:
+            block_dim = self.default_block_dim()
+
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        for dt in inputs:
+            tb_graph.new_input(dt, (-1, -1, -1), -1, True)
+        tb_graph.new_input(swa_cache_dt, (-1, -1, -1), -1, True)
+        all_ops = inputs + [swa_cache_dt]
+        pk.kn_graph.customized(all_ops, tb_graph)
+        pk.kn_graph.register_task(tb_graph, "mla_v4_swa_cache_write_sm100")
+        return swa_cache_dt
