@@ -216,6 +216,11 @@ enum TaskType {
   TASK_INDEXER_Q_TRANSFORM_SM100 = 361,     // Wave-2: indexer_q_transform
   TASK_INDEXER_SCORE_TOPK_SM100 = 362,      // Wave-2: indexer_score_topk
   TASK_HASH_ROUTE_LOOKUP_SM100 = 363,       // Wave-2: hash_route_lookup
+  // Wave 3.5 -- SWA cache write for the V4 MLA decode compile path.
+  // Slot reserved here so downstream agents do not collide; the supporting
+  // .cuh + task_register.cc entry land in the same wave as the
+  // DeepseekV4Block.compile() end-to-end wiring.
+  TASK_MLA_V4_SWA_CACHE_WRITE_SM100 = 364,  // Wave-3.5: mla_v4_swa_cache_write
   TASK_SM100_TASK_END = 370, // SM100 end placeholder, not a real task
   TASK_SCHD_TASKS = 200,
   TASK_SCHD_EVENTS = 201,
