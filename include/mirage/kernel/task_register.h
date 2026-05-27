@@ -218,6 +218,9 @@ public:
   // (low-rank Q expand via wq_b + RoPE + per-block MXFP4 + UE8M0)
   int register_indexer_q_transform_sm100_task(
       threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // DeepSeek V4-Flash Indexer score + Top-K (v1: contiguous KV cache)
+  int register_indexer_score_topk_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
   // SM100 tasks end
   // Multi-GPU tasks
   int register_nvshmem_allgather_strided_put_task(

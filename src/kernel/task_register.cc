@@ -5538,25 +5538,10 @@ int TaskRegister::register_mla_v4_decode_sm100_task(
 
 int TaskRegister::register_compressor_compress_sm100_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  // V4-Flash Compressor compress step (Wave-2 sub-batch C2).
-  //
-  // Inputs:
-  //   state_cache    [B, WINDOW, 2 * HEAD_DIM]    bf16
-  //   ape            [COMPRESS_RATIO, HEAD_DIM]   bf16
-  //   cos_sin_cache  [max_pos, ROPE_DIM]          bf16
-  //   norm_weight    [HEAD_DIM]                   bf16
-  //   positions      [T]                          int32
-  // Outputs:
-  //   kv_cache       [num_compressed_slots, slot_bytes]  uint8
-  //
+  // V4-Flash Compressor compress step.
   // params layout (7 ints):
-  //   params[0] = HEAD_DIM                 (template int)
-  //   params[1] = ROPE_DIM                 (template int)
-  //   params[2] = COMPRESS_RATIO           (template int)
-  //   params[3] = OVERLAP                  (0 / 1; template bool)
-  //   params[4] = BLOCK_SIZE               (FP8 quant block width)
-  //   params[5] = eps fp32 bits            (memcpy decode)
-  //   params[6] = kv_cache_token_stride_bytes  (0 ⇒ default slot bytes)
+  //   [0]=HEAD_DIM, [1]=ROPE_DIM, [2]=COMPRESS_RATIO, [3]=OVERLAP,
+  //   [4]=BLOCK_SIZE, [5]=eps fp32 bits, [6]=kv_cache_token_stride_bytes.
   assert(params.size() == 7);
   int head_dim = params[0];
   int rope_dim = params[1];
@@ -5581,35 +5566,27 @@ int TaskRegister::register_compressor_compress_sm100_task(
     }
   }
 
-  // Light validation against the template parameters declared in `params`.
   // state_cache: [B, WINDOW, 2*HEAD_DIM]
   assert(input_ops[0]->dtensor.num_dims == 3);
   assert(input_ops[0]->dtensor.dim[2] == 2 * head_dim);
-  // ape: [COMPRESS_RATIO, HEAD_DIM]
   assert(input_ops[1]->dtensor.num_dims == 2);
   assert(input_ops[1]->dtensor.dim[0] == compress_ratio);
   assert(input_ops[1]->dtensor.dim[1] == head_dim);
-  // cos_sin_cache: [max_pos, ROPE_DIM]
   assert(input_ops[2]->dtensor.num_dims == 2);
   assert(input_ops[2]->dtensor.dim[1] == rope_dim);
-  // norm_weight: [HEAD_DIM]
   assert(input_ops[3]->dtensor.num_dims == 1);
   assert(input_ops[3]->dtensor.dim[0] == head_dim);
-  // positions: [T]
   assert(input_ops[4]->dtensor.num_dims == 1);
-  int num_tokens_total = input_ops[4]->dtensor.dim[0];
-  // kv_cache: 2-D uint8 slab [num_compressed_slots, slot_bytes] in v1.
+  int num_tokens_total_cc = input_ops[4]->dtensor.dim[0];
   assert(output_ops[0]->dtensor.num_dims == 2 ||
          output_ops[0]->dtensor.num_dims == 1);
 
-  // Threads: match the established Blackwell convention (256). Fall back
-  // when HEAD_DIM is smaller than the warp count we'd need.
-  int num_threads = 256;
+  int num_threads_cc = 256;
   if (head_dim < 128) {
-    num_threads = 128;
+    num_threads_cc = 128;
   }
   if (head_dim < 64) {
-    num_threads = 64;
+    num_threads_cc = 64;
   }
 
   mirage::transpiler::CodeKeeper code_cc;
@@ -5621,16 +5598,16 @@ int TaskRegister::register_compressor_compress_sm100_task(
       compress_ratio,
       overlap ? std::string("true") : std::string("false"),
       block_size,
-      num_threads);
-  code_cc.e("    task_desc->input_ptrs[0],");  // state_cache
-  code_cc.e("    task_desc->input_ptrs[1],");  // ape
-  code_cc.e("    task_desc->input_ptrs[2],");  // cos_sin_cache
-  code_cc.e("    task_desc->input_ptrs[3],");  // norm_weight
-  code_cc.e("    task_desc->input_ptrs[4],");  // positions
-  code_cc.e("    task_desc->output_ptrs[0],"); // kv_cache (uint8 paged)
+      num_threads_cc);
+  code_cc.e("    task_desc->input_ptrs[0],");
+  code_cc.e("    task_desc->input_ptrs[1],");
+  code_cc.e("    task_desc->input_ptrs[2],");
+  code_cc.e("    task_desc->input_ptrs[3],");
+  code_cc.e("    task_desc->input_ptrs[4],");
+  code_cc.e("    task_desc->output_ptrs[0],");
   code_cc.e("    task_desc->task_metadata.token_offset,");
-  code_cc.e("    1,"); // num_tokens_per_task = 1
-  code_cc.e("    $,", num_tokens_total);
+  code_cc.e("    1,");
+  code_cc.e("    $,", num_tokens_total_cc);
   code_cc.e("    0,");
   code_cc.e("    $,", kv_cache_token_stride_bytes);
   code_cc.e("    $f);", eps);
@@ -5640,16 +5617,6 @@ int TaskRegister::register_compressor_compress_sm100_task(
 
 int TaskRegister::register_indexer_q_transform_sm100_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  // V4-Flash Indexer per-step Q transform.
-  //
-  // Inputs:
-  //   q_lora        [T, Q_LORA_RANK]                bf16
-  //   wq_b          [INDEX_N_HEADS * INDEX_HEAD_DIM, Q_LORA_RANK] bf16
-  //   cos_sin_cache [max_pos, ROPE_DIM]             bf16
-  //   positions     [T]                             int32
-  // Outputs:
-  //   q_fp4   [T, INDEX_N_HEADS, INDEX_HEAD_DIM / 2]      uint8 (MXFP4 nibbles)
-  //   q_scale [T, INDEX_N_HEADS, INDEX_HEAD_DIM / 32]     uint8 (UE8M0 exponent)
   std::vector<tb::TBInputOp *> input_ops_iq;
   std::vector<tb::TBInputOp *> output_ops_iq;
   int const num_inputs_iq = 4;
@@ -5663,37 +5630,31 @@ int TaskRegister::register_indexer_q_transform_sm100_task(
       output_ops_iq.push_back(static_cast<tb::TBInputOp *>(op));
     }
   }
-  // q_lora: [T, Q_LORA_RANK]
   assert(input_ops_iq[0]->dtensor.num_dims == 2);
   int num_tokens_total_iq = input_ops_iq[0]->dtensor.dim[0];
   int q_lora_rank = input_ops_iq[0]->dtensor.dim[1];
-  // wq_b: [INDEX_N_HEADS * INDEX_HEAD_DIM, Q_LORA_RANK]
   assert(input_ops_iq[1]->dtensor.num_dims == 2);
   assert(input_ops_iq[1]->dtensor.dim[1] == q_lora_rank);
   int wq_b_rows = input_ops_iq[1]->dtensor.dim[0];
-  // cos_sin_cache: [max_pos, ROPE_DIM]
   assert(input_ops_iq[2]->dtensor.num_dims == 2);
   int rope_dim_iq = input_ops_iq[2]->dtensor.dim[1];
-  // positions: [T]
   assert(input_ops_iq[3]->dtensor.num_dims == 1);
   assert(input_ops_iq[3]->dtensor.dim[0] == num_tokens_total_iq);
-  // q_fp4: [T, INDEX_N_HEADS, INDEX_HEAD_DIM / 2]
   assert(output_ops_iq[0]->dtensor.num_dims == 3);
   assert(output_ops_iq[0]->dtensor.dim[0] == num_tokens_total_iq);
-  int index_n_heads = output_ops_iq[0]->dtensor.dim[1];
+  int index_n_heads_iq = output_ops_iq[0]->dtensor.dim[1];
   int half_index_head_dim = output_ops_iq[0]->dtensor.dim[2];
-  int index_head_dim = half_index_head_dim * 2;
-  // q_scale: [T, INDEX_N_HEADS, INDEX_HEAD_DIM / 32]
+  int index_head_dim_iq = half_index_head_dim * 2;
   assert(output_ops_iq[1]->dtensor.num_dims == 3);
   assert(output_ops_iq[1]->dtensor.dim[0] == num_tokens_total_iq);
-  assert(output_ops_iq[1]->dtensor.dim[1] == index_n_heads);
-  assert(output_ops_iq[1]->dtensor.dim[2] == index_head_dim / 32);
-  assert(wq_b_rows == index_n_heads * index_head_dim);
-  assert(index_head_dim % 32 == 0);
+  assert(output_ops_iq[1]->dtensor.dim[1] == index_n_heads_iq);
+  assert(output_ops_iq[1]->dtensor.dim[2] == index_head_dim_iq / 32);
+  assert(wq_b_rows == index_n_heads_iq * index_head_dim_iq);
+  assert(index_head_dim_iq % 32 == 0);
   assert(rope_dim_iq % 2 == 0);
-  assert(rope_dim_iq <= index_head_dim);
+  assert(rope_dim_iq <= index_head_dim_iq);
 
-  int num_threads_iq = index_head_dim;
+  int num_threads_iq = index_head_dim_iq;
   assert(num_threads_iq % 32 == 0);
   (void)params;
 
@@ -5701,8 +5662,8 @@ int TaskRegister::register_indexer_q_transform_sm100_task(
   code_iq.inc_indent();
   code_iq.e("kernel::indexer_q_transform_task_impl<$, $, $, $, $>(",
             q_lora_rank,
-            index_n_heads,
-            index_head_dim,
+            index_n_heads_iq,
+            index_head_dim_iq,
             rope_dim_iq,
             num_threads_iq);
   code_iq.e("    task_desc->input_ptrs[0],");
@@ -5716,6 +5677,76 @@ int TaskRegister::register_indexer_q_transform_sm100_task(
   code_iq.e("    $);", num_tokens_total_iq);
   return register_task_variant(TASK_INDEXER_Q_TRANSFORM_SM100,
                                code_iq.to_string());
+}
+
+int TaskRegister::register_indexer_score_topk_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // V4-Flash Indexer score + Top-K (v1: contiguous KV cache).
+  // params[0]=TOPK, params[1]=compress_ratio.
+  assert(params.size() == 2);
+  int topk = params[0];
+  int score_compress_ratio = params[1];
+
+  std::vector<tb::TBInputOp *> input_ops_st;
+  std::vector<tb::TBInputOp *> output_ops_st;
+  int const num_inputs_st = 4;
+  int const num_outputs_st = 1;
+  assert(bgraph.operators.size() == (size_t)num_inputs_st + num_outputs_st);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops_st.size() < (size_t)num_inputs_st) {
+      input_ops_st.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops_st.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  // q: [T, INDEX_N_HEADS, INDEX_HEAD_DIM]
+  assert(input_ops_st[0]->dtensor.num_dims == 3);
+  int num_tokens_total_st = input_ops_st[0]->dtensor.dim[0];
+  int index_n_heads_st = input_ops_st[0]->dtensor.dim[1];
+  int index_head_dim_st = input_ops_st[0]->dtensor.dim[2];
+  // kv_cache: [S_max, INDEX_HEAD_DIM]
+  assert(input_ops_st[1]->dtensor.num_dims == 2);
+  int s_max = input_ops_st[1]->dtensor.dim[0];
+  assert(input_ops_st[1]->dtensor.dim[1] == index_head_dim_st);
+  // weights_proj: [T, INDEX_N_HEADS]
+  assert(input_ops_st[2]->dtensor.num_dims == 2);
+  assert(input_ops_st[2]->dtensor.dim[0] == num_tokens_total_st);
+  assert(input_ops_st[2]->dtensor.dim[1] == index_n_heads_st);
+  // positions: [T]
+  assert(input_ops_st[3]->dtensor.num_dims == 1);
+  assert(input_ops_st[3]->dtensor.dim[0] == num_tokens_total_st);
+  // topk_indices: [T, TOPK]
+  assert(output_ops_st[0]->dtensor.num_dims == 2);
+  assert(output_ops_st[0]->dtensor.dim[0] == num_tokens_total_st);
+  assert(output_ops_st[0]->dtensor.dim[1] == topk);
+
+  int num_threads_st = 256;
+  if (index_head_dim_st < 128) {
+    num_threads_st = 128;
+  }
+  if (index_head_dim_st < 64) {
+    num_threads_st = 64;
+  }
+
+  mirage::transpiler::CodeKeeper code_st;
+  code_st.inc_indent();
+  code_st.e("kernel::indexer_score_topk_task_impl<$, $, $, $>(",
+            index_n_heads_st,
+            index_head_dim_st,
+            topk,
+            num_threads_st);
+  code_st.e("    task_desc->input_ptrs[0],");
+  code_st.e("    task_desc->input_ptrs[1],");
+  code_st.e("    task_desc->input_ptrs[2],");
+  code_st.e("    task_desc->input_ptrs[3],");
+  code_st.e("    task_desc->output_ptrs[0],");
+  code_st.e("    task_desc->task_metadata.token_offset,");
+  code_st.e("    $,", num_tokens_total_st);
+  code_st.e("    $,", s_max);
+  code_st.e("    $);", score_compress_ratio);
+  return register_task_variant(TASK_INDEXER_SCORE_TOPK_SM100,
+                               code_st.to_string());
 }
 
 } // namespace runtime

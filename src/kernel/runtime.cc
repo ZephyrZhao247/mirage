@@ -486,14 +486,17 @@ void register_mugraph(
               task.task_metadata.num_tokens_per_task = 1;
             }
             // DeepSeek V4-Flash Compressor compress step:
-            // grid=(num_compressed_tokens,), one CTA per boundary token.
             if (task_type == TASK_COMPRESSOR_COMPRESS_SM100) {
               task.task_metadata.token_offset = bid.x;
               task.task_metadata.num_tokens_per_task = 1;
             }
-            // DeepSeek V4-Flash Indexer per-step Q transform: grid=(num_tokens,),
-            // one CTA per token.
+            // DeepSeek V4-Flash Indexer per-step Q transform:
             if (task_type == TASK_INDEXER_Q_TRANSFORM_SM100) {
+              task.task_metadata.token_offset = bid.x;
+              task.task_metadata.num_tokens_per_task = 1;
+            }
+            // DeepSeek V4-Flash Indexer score + Top-K:
+            if (task_type == TASK_INDEXER_SCORE_TOPK_SM100) {
               task.task_metadata.token_offset = bid.x;
               task.task_metadata.num_tokens_per_task = 1;
             }
@@ -1902,6 +1905,8 @@ TaskGraphResult print_task_graph(
   task_type_to_name[TASK_MLA_V4_PREFILL_SM100] =
       "TASK_MLA_V4_PREFILL_SM100";
   task_type_to_name[TASK_MLA_V4_DECODE_SM100] = "TASK_MLA_V4_DECODE_SM100";
+  task_type_to_name[TASK_INDEXER_SCORE_TOPK_SM100] =
+      "TASK_INDEXER_SCORE_TOPK_SM100";
   task_type_to_name[TASK_INV_ROPE_FP8_QUANT_O_SM100] =
       "TASK_INV_ROPE_FP8_QUANT_O_SM100";
   task_type_to_name[TASK_COMPRESSOR_COMPRESS_SM100] =
