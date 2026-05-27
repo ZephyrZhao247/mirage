@@ -71,6 +71,7 @@ from .rotary import RotaryEmbedding
 
 # Attention (plain decode + paged prefill/decode + multi-token extend; MLA / split-KV in follow-ups)
 from .attention.attention import Attention
+from .attention.indexer_q_transform import IndexerQTransform
 from .attention.inv_rope_fp8_quant_o import InvRopeFP8QuantO
 from .attention.mla_v4_decode import MLAv4Decode
 from .attention.mla_v4_prefill import MLAv4Prefill
@@ -201,6 +202,7 @@ __all__ = [
     "RotaryEmbedding",
     # attention
     "Attention",
+    "IndexerQTransform",
     "InvRopeFP8QuantO",
     "MLAv4Decode",
     "MLAv4Prefill",

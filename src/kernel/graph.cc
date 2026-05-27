@@ -863,6 +863,13 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     // 4 inputs (q, swa_cache, positions, attn_sink), 1 output (o)
     task_config[op] =
         std::make_tuple(4, 1, TASK_MLA_V4_DECODE_SM100, variant_id);
+  } else if (name == "indexer_q_transform_sm100") {
+    int variant_id = task_register->register_indexer_q_transform_sm100_task(
+        customized->bgraph, params);
+    // 4 inputs (q_lora, wq_b, cos_sin_cache, positions),
+    // 2 outputs (q_fp4, q_scale)
+    task_config[op] =
+        std::make_tuple(4, 2, TASK_INDEXER_Q_TRANSFORM_SM100, variant_id);
   }
   // MTP tasks
   else if (name == "mtp_verify_strict") {

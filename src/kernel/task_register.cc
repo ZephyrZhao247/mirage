@@ -5455,5 +5455,101 @@ int TaskRegister::register_mla_v4_decode_sm100_task(
   return register_task_variant(TASK_MLA_V4_DECODE_SM100, code.to_string());
 }
 
+int TaskRegister::register_indexer_q_transform_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // V4-Flash Indexer per-step Q transform.
+  //
+  // Inputs:
+  //   q_lora        [T, Q_LORA_RANK]                bf16
+  //   wq_b          [INDEX_N_HEADS * INDEX_HEAD_DIM, Q_LORA_RANK] bf16
+  //                 (Hadamard pre-absorbed at convert time, NOT applied
+  //                  at runtime)
+  //   cos_sin_cache [max_pos, ROPE_DIM]             bf16
+  //   positions     [T]                             int32
+  // Outputs:
+  //   q_fp4   [T, INDEX_N_HEADS, INDEX_HEAD_DIM / 2]      uint8
+  //           (two MXFP4/E2M1 nibbles per byte)
+  //   q_scale [T, INDEX_N_HEADS, INDEX_HEAD_DIM / 32]     uint8
+  //           (UE8M0 exponent byte per block of 32 elements)
+  //
+  // The kernel is templated on <Q_LORA_RANK, INDEX_N_HEADS, INDEX_HEAD_DIM,
+  // ROPE_DIM, NUM_THREADS> — all derived from the input/output dtensor
+  // shapes. ``num_tokens_per_task`` is hard-coded to 1 (one CTA per token,
+  // v1).
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int const num_inputs = 4;
+  int const num_outputs = 2;
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  // q_lora: [T, Q_LORA_RANK]
+  assert(input_ops[0]->dtensor.num_dims == 2);
+  int num_tokens_total = input_ops[0]->dtensor.dim[0];
+  int q_lora_rank = input_ops[0]->dtensor.dim[1];
+  // wq_b: [INDEX_N_HEADS * INDEX_HEAD_DIM, Q_LORA_RANK]
+  assert(input_ops[1]->dtensor.num_dims == 2);
+  assert(input_ops[1]->dtensor.dim[1] == q_lora_rank);
+  int wq_b_rows = input_ops[1]->dtensor.dim[0];
+  // cos_sin_cache: [max_pos, ROPE_DIM]
+  assert(input_ops[2]->dtensor.num_dims == 2);
+  int rope_dim = input_ops[2]->dtensor.dim[1];
+  // positions: [T]
+  assert(input_ops[3]->dtensor.num_dims == 1);
+  assert(input_ops[3]->dtensor.dim[0] == num_tokens_total);
+  // q_fp4: [T, INDEX_N_HEADS, INDEX_HEAD_DIM / 2]
+  assert(output_ops[0]->dtensor.num_dims == 3);
+  assert(output_ops[0]->dtensor.dim[0] == num_tokens_total);
+  int index_n_heads = output_ops[0]->dtensor.dim[1];
+  int half_index_head_dim = output_ops[0]->dtensor.dim[2];
+  int index_head_dim = half_index_head_dim * 2;
+  // q_scale: [T, INDEX_N_HEADS, INDEX_HEAD_DIM / 32]
+  assert(output_ops[1]->dtensor.num_dims == 3);
+  assert(output_ops[1]->dtensor.dim[0] == num_tokens_total);
+  assert(output_ops[1]->dtensor.dim[1] == index_n_heads);
+  assert(output_ops[1]->dtensor.dim[2] == index_head_dim / 32);
+  // Consistency between wq_b and output shapes.
+  assert(wq_b_rows == index_n_heads * index_head_dim);
+  assert(index_head_dim % 32 == 0);
+  assert(rope_dim % 2 == 0);
+  assert(rope_dim <= index_head_dim);
+
+  // NUM_THREADS == INDEX_HEAD_DIM (one thread per output channel of one
+  // head). V4-Flash uses INDEX_HEAD_DIM=128. Test mode can use smaller
+  // values (multiples of 32).
+  int num_threads = index_head_dim;
+  assert(num_threads % 32 == 0);
+
+  // params (optional): currently unused — sizes are all inferred from
+  // the tensor shapes.
+  (void)params;
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::indexer_q_transform_task_impl<$, $, $, $, $>(",
+         q_lora_rank,
+         index_n_heads,
+         index_head_dim,
+         rope_dim,
+         num_threads);
+  code.e("    task_desc->input_ptrs[0],");   // q_lora
+  code.e("    task_desc->input_ptrs[1],");   // wq_b
+  code.e("    task_desc->input_ptrs[2],");   // cos_sin_cache
+  code.e("    task_desc->input_ptrs[3],");   // positions
+  code.e("    task_desc->output_ptrs[0],");  // q_fp4
+  code.e("    task_desc->output_ptrs[1],");  // q_scale
+  code.e("    task_desc->task_metadata.token_offset,");
+  code.e("    1,"); // num_tokens_per_task = 1 (v1: one CTA per token)
+  code.e("    $);", num_tokens_total);
+  return register_task_variant(TASK_INDEXER_Q_TRANSFORM_SM100,
+                               code.to_string());
+}
+
 } // namespace runtime
 } // namespace mirage
