@@ -199,20 +199,15 @@ public:
   // DeepSeek V4-Flash MLA pre-attention joint Q+KV RMSNorm
   int register_mla_v4_q_kv_rmsnorm_sm100_task(
       threadblock::Graph const &bgraph, std::vector<int> const &params);
-<<<<<<< HEAD
-<<<<<<< HEAD
   // DeepSeek V4-Flash MLA prefill KV gather (paged-to-contiguous, v1 SWA-only)
   int register_mla_v4_prefill_gather_sm100_task(
-=======
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
   // DeepSeek V4-Flash MLA prefill over gathered KV workspace
   int register_mla_v4_prefill_sm100_task(
->>>>>>> worktree-agent-ad47ab2d736573429
       threadblock::Graph const &bgraph, std::vector<int> const &params);
-=======
   // DeepSeek V4-Flash MLA decode (v1: SWA-only, compress_ratio=0)
   int register_mla_v4_decode_sm100_task(threadblock::Graph const &bgraph,
                                         std::vector<int> const &params);
->>>>>>> worktree-agent-ad37be2224024441a
   // SM100 tasks end
   // Multi-GPU tasks
   int register_nvshmem_allgather_strided_put_task(
