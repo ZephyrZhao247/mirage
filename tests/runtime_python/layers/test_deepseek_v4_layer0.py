@@ -135,31 +135,47 @@ def test_reference_forward_with_real_weights():
           "produces finite, bounded output with real Flash-Base weights.")
 
 
-def test_compiled_vs_reference_layer0_skipped():
-    """The compiled vs reference comparison is SKIPPED in Wave-3.
+def test_compiled_vs_reference_layer0():
+    """Compiled vs PyTorch-reference comparison for DeepseekV4Block L0.
 
-    Wave-4 will wire ``DeepseekV4Block.compile()`` once the following
-    integration gates land:
+    Wave 3.5 status (follow-up to 83c38ecc):
 
-      * FP8 MoE permute → group-GEMM w13 → SiluMul → group-GEMM w2
-        pipeline (the V3 path needs the V4 hash-routing indices wired
-        into ``moe_routing_indices``).
-      * SWA cache write-back from the freshly-computed kv (one paged-KV
-        store per token; ratio=0 needs only the window slot).
-      * Grouped o-projection (wo_a is per-group bmm; wo_b is dense row-
-      parallel FP8).
+      * Gap 4 (FP8 QAT on K/V nope dims): FIXED in the PyTorch reference.
+      * Gap 2 (grouped FP8 BMM for wo_a): identified -- existing
+        ``LinearFP8BMM`` matches the contract; no new code needed.
+      * Gap 3 (hash routing layout): adapter
+        ``HashRouteToExpertMajor`` landed (Python reference); kernel-
+        side fold OPEN for next wave.
+      * Gap 1 (SWA cache write-back): Python catalog scaffold landed
+        (``MLAv4SWACacheWrite``) and TaskType slot 364 reserved in
+        ``runtime_header.h``. The CUDA kernel itself + the
+        ``register_mla_v4_swa_cache_write_sm100_task`` entry in
+        ``src/kernel/task_register.cc`` are NOT landed -- the next
+        agent's first task.
 
-    Until then this test raises ``SkipTest`` with the explicit reason
-    so CI / runners do NOT treat it as silently-green. This matches the
-    Wave-3 constraint "do NOT commit a fake-passing test".
+    Because Gap 1's kernel is missing AND the compile body itself is not
+    yet wired end-to-end, this test still raises ``SkipTest`` rather
+    than fake-passing. The skip reason below explicitly enumerates the
+    remaining work so the next agent can pick up from a known state.
+
+    To un-skip in Wave 4:
+      1. Land ``tasks/blackwell/mla_v4_swa_cache_write_sm100.cuh`` +
+         ``register_mla_v4_swa_cache_write_sm100_task`` in
+         task_register.cc + dispatcher in graph.cc.
+      2. Implement ``DeepseekV4Block.compile()`` per the docstring (the
+         method comment-block describes the call sequence).
+      3. Remove the ``raise SkipTest`` below and run the body.
     """
     import unittest
     raise unittest.SkipTest(
-        "DeepseekV4Block.compile() is a Wave-3 scaffold. Wave-4 will "
-        "wire the FP8 MoE permute pipeline, the SWA cache write-back, "
-        "and the grouped o-projection GEMM. See "
-        "python/mirage/mpk/models/deepseek_v4/block.py for the OPEN "
-        "notes detailing what remains."
+        "DeepseekV4Block.compile() Wave 3.5 partial. Remaining: "
+        "(a) mla_v4_swa_cache_write_sm100 CUDA kernel (TaskType slot "
+        "364 reserved, Python scaffold at "
+        "python/mirage/mpk/layers/attention/mla_v4_swa_cache_write.py); "
+        "(b) DeepseekV4Block.compile() end-to-end wiring per its "
+        "docstring (LinearFP8BMM compose for wo_a, HashRouteToExpertMajor "
+        "for routing, QuantizeFP8(block=64) for K/V QAT, plus the "
+        "existing V3 MoE pipeline)."
     )
 
 
@@ -180,5 +196,7 @@ if __name__ == "__main__":
 
     # Print the SKIP marker without raising it standalone.
     print("\n" + "=" * 60)
-    print("[SKIP] test_compiled_vs_reference_layer0 — Wave-4 will enable.")
+    print("[SKIP] test_compiled_vs_reference_layer0 — Wave 3.5 partial; "
+          "see test docstring for remaining items (SWA cache write "
+          "kernel + compile() wiring).")
     print("=" * 60)

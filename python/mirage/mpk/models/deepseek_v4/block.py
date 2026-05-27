@@ -512,6 +512,36 @@ class DeepseekV4Block(MPKModule):
         # the weight ``to(x.dtype)`` before F.linear (see model.py:151).
         return F.linear(x, w_f32.to(x.dtype))
 
+    @staticmethod
+    def _fp8_qat_inplace(
+        x: torch.Tensor, rope_dim: int, block_size: int = 64
+    ) -> torch.Tensor:
+        """Wave 3.5 Gap 4: simulate per-128 FP8 E4M3 quant on K/V nope dims.
+
+        Replicates the effect of ``act_quant(kv[..., :-rope_dim], block_size,
+        ..., inplace=True)`` from deps/deepseek_v4/.../kernel.py: it
+        quantises the nope portion to FP8 then immediately dequantises it
+        back to bf16 (round-trip noise injection). The rope portion is left
+        untouched. Operates on a freshly returned tensor (not actually in-
+        place against the caller's allocation, but writes the result back
+        into the same object before returning).
+        """
+        nope = x[..., :-rope_dim].contiguous()
+        N = nope.size(-1)
+        if N % block_size != 0:
+            return x  # nothing to do
+        leading = nope.shape[:-1]
+        num_groups = N // block_size
+        grouped = nope.float().reshape(*leading, num_groups, block_size)
+        amax = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
+        # FP8 E4M3 max is 448.
+        scale = amax / 448.0
+        q = (grouped / scale).to(torch.float8_e4m3fn).float()
+        dq = (q * scale).reshape(*leading, N).to(x.dtype)
+        out = x.clone()
+        out[..., :-rope_dim] = dq
+        return out
+
     # ------------------------------------------------------------------
     # Freqs_cis for ratio=0 layers
     # ------------------------------------------------------------------
@@ -691,9 +721,14 @@ class DeepseekV4Block(MPKModule):
         kv3 = kv.unsqueeze(0).unsqueeze(2)   # [1, T, 1, head_dim]
         _apply_rotary_inplace(kv3[..., -rd:], fc_seg)
         kv = kv3.squeeze(2).squeeze(0)
-        # NOTE: official model also runs act_quant on kv[..., :-rd] (FP8 QAT
-        # simulation). For Wave-3 v1 we skip this — the divergence is the
-        # one-off FP8 quant noise in the K cache (<1% for bf16 tol).
+        # Wave 3.5 (Gap 4): apply FP8 QAT to kv[..., :-rd] (the nope dims).
+        # The official model calls ``act_quant(kv[..., :-rd], 64, ..., inplace=True)``
+        # which performs a fused quant-dequant round-trip in bf16 -- it does
+        # not change the dtype but introduces FP8 E4M3 quantisation noise on
+        # the nope portion of K/V (the rope portion is left untouched).
+        # Without this step the L0 reference vs official-PyTorch divergence
+        # on the K cache is ~1%; with it the bf16 tolerance lines up.
+        kv = self._fp8_qat_inplace(kv, rd, block_size=64)
 
         # === sparse_attn (ratio=0: dense over [position 0..t)) ===
         # Build the K/V tensor: stack the freshly computed kv with the SWA
@@ -826,7 +861,7 @@ class DeepseekV4Block(MPKModule):
         return (y.to(x.dtype) + shared).to(x.dtype)
 
     # ==================================================================
-    # MPK compile() — Wave-3 best-effort scaffold
+    # MPK compile() — Wave-3.5 best-effort scaffold
     # ==================================================================
     def compile(
         self,
@@ -841,22 +876,50 @@ class DeepseekV4Block(MPKModule):
     ):
         """Best-effort MPK composition of the V4 catalog modules.
 
-        OPEN (Wave-3 incomplete): the FP8 weight conversion, the MoE
-        permute pipeline, the SWA cache write-back, and the o-projection
-        grouped GEMM still need to be wired against the V3-reused MPK
-        kernel signatures. The Wave-3 deliverable validates the catalog
-        modules' independent ``compile()`` tests + the PyTorch reference
-        ``forward()``; the per-layer compiled-vs-reference test is
-        currently SKIPPED until those gates land. See
-        ``tests/runtime_python/layers/test_deepseek_v4_layer0.py`` for
-        the test scaffold.
+        Wave 3.5 status (follow-up to 83c38ecc):
+
+        * Gap 4 (FP8 QAT on K/V nope dims): FIXED in the PyTorch
+          reference ``forward()``. The MPK compile path needs to insert
+          ``QuantizeFP8(block_size=64)`` followed by an in-place dequant
+          before the ``MLAv4Decode`` consumes K/V; the catalog module
+          exists at ``python/mirage/mpk/layers/quantize_fp8.py``. Not yet
+          wired here.
+
+        * Gap 2 (grouped FP8 BMM for wo_a): the existing
+          ``LinearFP8BMM`` catalog matches the V4 wo_a shape contract
+          exactly --
+          ``[T, groups, per_group] @ [groups, o_lora, per_group]^T
+          -> [T, groups, o_lora]``. Wave 4 should compose this directly
+          (no new kernel required); ``num_heads = o_groups``,
+          ``in_features_per_head = num_heads * head_dim / o_groups``,
+          ``out_features_per_head = o_lora_rank``.
+
+        * Gap 3 (hash routing vs V3 MoE permute): ``HashRouteLookup``
+          outputs ``[T, K]`` int32 token-major; ``MoEPermute`` wants
+          ``[E_LOCAL, MBT]`` int32 expert-major + 1-indexed. See
+          ``python/mirage/mpk/layers/moe/hash_route_to_expert_major.py``
+          for the adapter (Python reference today, kernel-fold OPEN).
+
+        * Gap 1 (SWA cache write-back): catalog scaffold landed at
+          ``python/mirage/mpk/layers/attention/mla_v4_swa_cache_write.py``
+          with reserved ``TaskType TASK_MLA_V4_SWA_CACHE_WRITE_SM100=364``
+          in ``runtime_header.h``. The CUDA kernel and ``task_register.cc``
+          entry are NOT landed -- next agent's first task.
+
+        Until all four gaps are wired into a single contiguous
+        compile-scope block, this method raises
+        :class:`NotImplementedError`. The companion test
+        ``test_compiled_vs_reference_layer0`` remains SKIP with the
+        precise outstanding-work description.
         """
         raise NotImplementedError(
-            "DeepseekV4Block.compile() is a Wave-3 scaffold. Wave-4 wires "
-            "the FP8 MoE permute pipeline, the SWA cache write-back, and "
-            "the grouped o-projection GEMM. Use ``forward()`` for the "
-            "PyTorch oracle path; individual catalog modules compile "
-            "fine and pass their own test_mode tests."
+            "DeepseekV4Block.compile() is a Wave-3.5 scaffold. Wave-4 "
+            "must (a) wire LinearFP8BMM for wo_a, (b) land the new "
+            "mla_v4_swa_cache_write_sm100 CUDA kernel + task_register "
+            "entry, (c) wire HashRouteToExpertMajor (or fold into "
+            "MoEPermute), and (d) thread the FP8 QAT step (gap 4) into "
+            "the compile path between MLAv4QKVRMSNorm and MLAv4Decode. "
+            "See this method's docstring for per-gap detail."
         )
 
     def auto_grid_dim(self, *args, **kwargs):
