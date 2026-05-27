@@ -199,6 +199,9 @@ public:
   // DeepSeek V4-Flash MLA pre-attention joint Q+KV RMSNorm
   int register_mla_v4_q_kv_rmsnorm_sm100_task(
       threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // DeepSeek V4-Flash MLA decode (v1: SWA-only, compress_ratio=0)
+  int register_mla_v4_decode_sm100_task(threadblock::Graph const &bgraph,
+                                        std::vector<int> const &params);
   // SM100 tasks end
   // Multi-GPU tasks
   int register_nvshmem_allgather_strided_put_task(
