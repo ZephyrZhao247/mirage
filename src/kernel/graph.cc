@@ -688,6 +688,14 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     // 3 inputs (o, cos_sin_cache, positions), 2 outputs (o_fp8, o_scale)
     task_config[op] =
         std::make_tuple(3, 2, TASK_INV_ROPE_FP8_QUANT_O_SM100, variant_id);
+  } else if (name == "compressor_state_update_sm100") {
+    int variant_id =
+        task_register->register_compressor_state_update_sm100_task(
+            customized->bgraph, params);
+    // 5 inputs (kv, score, ape, positions, slot_mapping),
+    // 1 output (state_cache, in-place ring buffer).
+    task_config[op] = std::make_tuple(
+        5, 1, TASK_COMPRESSOR_STATE_UPDATE_SM100, variant_id);
   } else if (name == "softmax_gather_sm100") {
     int variant_id = task_register->register_softmax_gather_sm100_task(
         customized->bgraph, params);

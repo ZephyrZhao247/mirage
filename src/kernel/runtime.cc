@@ -465,6 +465,12 @@ void register_mugraph(
               task.task_metadata.token_offset = bid.x;
               task.task_metadata.num_tokens_per_task = 1;
             }
+            // DeepSeek V4-Flash Compressor state-update: grid=(num_tokens,),
+            // one CTA per token. token_offset = bid.x; num_tokens_per_task = 1.
+            if (task_type == TASK_COMPRESSOR_STATE_UPDATE_SM100) {
+              task.task_metadata.token_offset = bid.x;
+              task.task_metadata.num_tokens_per_task = 1;
+            }
             // DeepSeek V4-Flash MLA prefill over gathered-KV workspace:
             // grid=(num_q_tiles,), one CTA per Q-tile. token_offset = bid.x
             // (interpreted as the q_tile_offset inside the kernel, i.e. the
@@ -1888,6 +1894,8 @@ TaskGraphResult print_task_graph(
       "TASK_INV_ROPE_FP8_QUANT_O_SM100";
   task_type_to_name[TASK_MLA_V4_PREFILL_GATHER_SM100] =
       "TASK_MLA_V4_PREFILL_GATHER_SM100";
+  task_type_to_name[TASK_COMPRESSOR_STATE_UPDATE_SM100] =
+      "TASK_COMPRESSOR_STATE_UPDATE_SM100";
   task_type_to_name[TASK_SOFTMAX_GATHER_SM100] = "TASK_SOFTMAX_GATHER_SM100";
   task_type_to_name[TASK_MTP_VERIFY_PROBABILISTIC] =
       "TASK_MTP_VERIFY_PROBABILISTIC";
