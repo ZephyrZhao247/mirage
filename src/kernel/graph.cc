@@ -844,6 +844,12 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     // 4 inputs (q_in, kv_in, q_weight, kv_weight), 2 outputs (q_out, kv_out)
     task_config[op] = std::make_tuple(
         4, 2, TASK_MLA_V4_Q_KV_RMSNORM_SM100, variant_id);
+  } else if (name == "mla_v4_prefill_sm100") {
+    int variant_id = task_register->register_mla_v4_prefill_sm100_task(
+        customized->bgraph, params);
+    // 3 inputs (q, gathered_kv, attn_sink), 1 output (o)
+    task_config[op] = std::make_tuple(
+        3, 1, TASK_MLA_V4_PREFILL_SM100, variant_id);
   }
   // MTP tasks
   else if (name == "mtp_verify_strict") {
