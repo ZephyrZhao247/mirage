@@ -5035,6 +5035,97 @@ int TaskRegister::register_mla_v4_q_kv_rmsnorm_sm100_task(
                                code.to_string());
 }
 
+int TaskRegister::register_mla_v4_prefill_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // DeepSeek V4-Flash MLA prefill over a gathered KV workspace.
+  //
+  // Inputs:
+  //   q             [T_q,  NUM_HEADS, HEAD_DIM] bf16 (broadcast — kernel
+  //                                                    addresses via
+  //                                                    task_metadata.token_offset)
+  //   gathered_kv   [T_kv, HEAD_DIM]            bf16 (broadcast)
+  //   attn_sink     [NUM_HEADS]                 fp32 (broadcast)
+  // Output:
+  //   o             [T_q,  NUM_HEADS, HEAD_DIM] bf16 (broadcast)
+  //
+  // Params (compiled into the codegen string):
+  //   params[0] = softmax_scale_fp32_bits  (reinterpret_cast int)
+  //
+  // For v1 we hard-wire Q_TILE = 1 (one CTA per Q row) and KV_TILE = 32
+  // (a small power-of-two tile that's large enough to amortize the
+  // per-tile reduction but small enough that the per-thread logit array
+  // is cheap). NUM_THREADS = 128 to match the rmsnorm pattern.
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int const num_inputs = 3;
+  int const num_outputs = 1;
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  // q: [T_q, NUM_HEADS, HEAD_DIM]
+  assert(input_ops[0]->dtensor.num_dims == 3);
+  int t_q = input_ops[0]->dtensor.dim[0];
+  int num_heads = input_ops[0]->dtensor.dim[1];
+  int head_dim = input_ops[0]->dtensor.dim[2];
+  // gathered_kv: [T_kv, HEAD_DIM]
+  assert(input_ops[1]->dtensor.num_dims == 2);
+  int t_kv = input_ops[1]->dtensor.dim[0];
+  assert(input_ops[1]->dtensor.dim[1] == head_dim);
+  // attn_sink: [NUM_HEADS]
+  assert(input_ops[2]->dtensor.num_dims == 1);
+  assert(input_ops[2]->dtensor.dim[0] == num_heads);
+  // o: [T_q, NUM_HEADS, HEAD_DIM]
+  assert(output_ops[0]->dtensor.num_dims == 3);
+  assert(output_ops[0]->dtensor.dim[0] == t_q);
+  assert(output_ops[0]->dtensor.dim[1] == num_heads);
+  assert(output_ops[0]->dtensor.dim[2] == head_dim);
+
+  // Decode softmax_scale (passed as float bit-pattern in params[0]).
+  float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+  if (!params.empty()) {
+    int bits = params[0];
+    softmax_scale = *reinterpret_cast<float *>(&bits);
+  }
+
+  constexpr int kQTile = 1;
+  constexpr int kKvTile = 32;
+  // Pick NUM_THREADS that divides HEAD_DIM cleanly (so the strided
+  // dot/accum loops have no tail). 128 covers V4-Flash (HEAD_DIM=512),
+  // fall back to 64/32 for smaller widths used in unit tests.
+  int num_threads = 128;
+  if (head_dim % num_threads != 0) {
+    num_threads = 64;
+  }
+  if (head_dim % num_threads != 0) {
+    num_threads = 32;
+  }
+  assert(head_dim % num_threads == 0);
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::mla_v4_prefill_task_impl<$, $, $, $, $>(",
+         num_heads,
+         head_dim,
+         kQTile,
+         kKvTile,
+         num_threads);
+  code.e("    task_desc->input_ptrs[0],");   // q
+  code.e("    task_desc->input_ptrs[1],");   // gathered_kv
+  code.e("    task_desc->input_ptrs[2],");   // attn_sink
+  code.e("    task_desc->output_ptrs[0],");  // o
+  code.e("    task_desc->task_metadata.token_offset,");
+  code.e("    $,", t_q);
+  code.e("    $,", t_kv);
+  code.e("    $f);", softmax_scale);
+  return register_task_variant(TASK_MLA_V4_PREFILL_SM100, code.to_string());
+}
+
 int TaskRegister::register_hash_route_lookup_sm100_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
   // V4-Flash hash routing for early MoE layers.

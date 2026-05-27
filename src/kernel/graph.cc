@@ -851,6 +851,12 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     // tensors are read from runtime_config inside the generated code.
     task_config[op] = std::make_tuple(
         1, 1, TASK_MLA_V4_PREFILL_GATHER_SM100, variant_id);
+  } else if (name == "mla_v4_prefill_sm100") {
+    int variant_id = task_register->register_mla_v4_prefill_sm100_task(
+        customized->bgraph, params);
+    // 3 inputs (q, gathered_kv, attn_sink), 1 output (o)
+    task_config[op] = std::make_tuple(
+        3, 1, TASK_MLA_V4_PREFILL_SM100, variant_id);
   }
   // MTP tasks
   else if (name == "mtp_verify_strict") {
