@@ -3,6 +3,7 @@
 from .attention import Attention
 from .compressor_compress import CompressorCompress
 from .compressor_state_update import CompressorStateUpdate
+from .indexer_q_transform import IndexerQTransform
 from .inv_rope_fp8_quant_o import InvRopeFP8QuantO
 from .mla_v4_decode import MLAv4Decode
 from .mla_v4_prefill import MLAv4Prefill
@@ -15,6 +16,7 @@ __all__ = [
     "Attention",
     "CompressorCompress",
     "CompressorStateUpdate",
+    "IndexerQTransform",
     "InvRopeFP8QuantO",
     "MLAv4Decode",
     "MLAv4Prefill",

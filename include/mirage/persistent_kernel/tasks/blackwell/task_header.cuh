@@ -39,6 +39,7 @@
 #include "elementwise_add_sm100.cuh"
 #include "hash_route_lookup_sm100.cuh"
 #include "compressor_compress_sm100.cuh"
+#include "indexer_q_transform_sm100.cuh"
 #include "inv_rope_fp8_quant_o_sm100.cuh"
 #include "mhc_head_sm100.cuh"
 #include "mhc_post_sm100.cuh"

@@ -73,6 +73,7 @@ from .rotary import RotaryEmbedding
 from .attention.attention import Attention
 from .attention.compressor_compress import CompressorCompress
 from .attention.compressor_state_update import CompressorStateUpdate
+from .attention.indexer_q_transform import IndexerQTransform
 from .attention.inv_rope_fp8_quant_o import InvRopeFP8QuantO
 from .attention.mla_v4_decode import MLAv4Decode
 from .attention.mla_v4_prefill import MLAv4Prefill
@@ -205,6 +206,7 @@ __all__ = [
     "Attention",
     "CompressorCompress",
     "CompressorStateUpdate",
+    "IndexerQTransform",
     "InvRopeFP8QuantO",
     "MLAv4Decode",
     "MLAv4Prefill",
