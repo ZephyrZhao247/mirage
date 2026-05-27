@@ -5455,5 +5455,92 @@ int TaskRegister::register_mla_v4_decode_sm100_task(
   return register_task_variant(TASK_MLA_V4_DECODE_SM100, code.to_string());
 }
 
+int TaskRegister::register_indexer_score_topk_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // DeepSeek V4-Flash Indexer score + Top-K (v1: contiguous KV cache, bf16
+  // q/kv, fp32 weights_proj).
+  //
+  // Inputs:
+  //   q              [T, INDEX_N_HEADS, INDEX_HEAD_DIM]  bf16
+  //   kv_cache       [S_max, INDEX_HEAD_DIM]             bf16 (contiguous)
+  //   weights_proj   [T, INDEX_N_HEADS]                  fp32
+  //   positions      [T]                                  int32
+  // Outputs:
+  //   topk_indices   [T, TOPK]                            int32
+  //
+  // params[0] = TOPK              (template parameter).
+  // params[1] = compress_ratio    (causal mask divisor; v1 default 4).
+  //
+  // The leading T / S_max / INDEX_N_HEADS / INDEX_HEAD_DIM are read from
+  // the DTensor shapes.
+  assert(params.size() == 2);
+  int topk = params[0];
+  int compress_ratio = params[1];
+
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int const num_inputs = 4;
+  int const num_outputs = 1;
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+
+  // q: [T, INDEX_N_HEADS, INDEX_HEAD_DIM]
+  assert(input_ops[0]->dtensor.num_dims == 3);
+  int num_tokens_total = input_ops[0]->dtensor.dim[0];
+  int index_n_heads = input_ops[0]->dtensor.dim[1];
+  int index_head_dim = input_ops[0]->dtensor.dim[2];
+  // kv_cache: [S_max, INDEX_HEAD_DIM] (2-D contiguous).
+  assert(input_ops[1]->dtensor.num_dims == 2);
+  int s_max = input_ops[1]->dtensor.dim[0];
+  assert(input_ops[1]->dtensor.dim[1] == index_head_dim);
+  // weights_proj: [T, INDEX_N_HEADS]
+  assert(input_ops[2]->dtensor.num_dims == 2);
+  assert(input_ops[2]->dtensor.dim[0] == num_tokens_total);
+  assert(input_ops[2]->dtensor.dim[1] == index_n_heads);
+  // positions: [T]
+  assert(input_ops[3]->dtensor.num_dims == 1);
+  assert(input_ops[3]->dtensor.dim[0] == num_tokens_total);
+  // topk_indices: [T, TOPK]
+  assert(output_ops[0]->dtensor.num_dims == 2);
+  assert(output_ops[0]->dtensor.dim[0] == num_tokens_total);
+  assert(output_ops[0]->dtensor.dim[1] == topk);
+
+  // 256 threads/CTA on Blackwell. Drop to 128 for tiny head_dim so the
+  // dot-product reduction still fans out cleanly.
+  int num_threads = 256;
+  if (index_head_dim < 128) {
+    num_threads = 128;
+  }
+  if (index_head_dim < 64) {
+    num_threads = 64;
+  }
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::indexer_score_topk_task_impl<$, $, $, $>(",
+         index_n_heads,
+         index_head_dim,
+         topk,
+         num_threads);
+  code.e("    task_desc->input_ptrs[0],");   // q
+  code.e("    task_desc->input_ptrs[1],");   // kv_cache
+  code.e("    task_desc->input_ptrs[2],");   // weights_proj
+  code.e("    task_desc->input_ptrs[3],");   // positions
+  code.e("    task_desc->output_ptrs[0],");  // topk_indices
+  code.e("    task_desc->task_metadata.token_offset,");
+  code.e("    $,", num_tokens_total);
+  code.e("    $,", s_max);
+  code.e("    $);", compress_ratio);
+  return register_task_variant(TASK_INDEXER_SCORE_TOPK_SM100,
+                               code.to_string());
+}
+
 } // namespace runtime
 } // namespace mirage

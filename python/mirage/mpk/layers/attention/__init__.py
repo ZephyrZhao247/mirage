@@ -1,6 +1,7 @@
 """Attention layers (plain decode + paged; MLA / split-KV come in follow-ups)."""
 
 from .attention import Attention
+from .indexer_score_topk import IndexerScoreTopK
 from .inv_rope_fp8_quant_o import InvRopeFP8QuantO
 from .mla_v4_decode import MLAv4Decode
 from .mla_v4_prefill import MLAv4Prefill
@@ -11,6 +12,7 @@ from .single_batch_extend_attention import SingleBatchExtendAttention
 
 __all__ = [
     "Attention",
+    "IndexerScoreTopK",
     "InvRopeFP8QuantO",
     "MLAv4Decode",
     "MLAv4Prefill",

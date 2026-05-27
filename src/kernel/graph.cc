@@ -863,6 +863,12 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     // 4 inputs (q, swa_cache, positions, attn_sink), 1 output (o)
     task_config[op] =
         std::make_tuple(4, 1, TASK_MLA_V4_DECODE_SM100, variant_id);
+  } else if (name == "indexer_score_topk_sm100") {
+    int variant_id = task_register->register_indexer_score_topk_sm100_task(
+        customized->bgraph, params);
+    // 4 inputs (q, kv_cache, weights_proj, positions), 1 output (topk_indices)
+    task_config[op] =
+        std::make_tuple(4, 1, TASK_INDEXER_SCORE_TOPK_SM100, variant_id);
   }
   // MTP tasks
   else if (name == "mtp_verify_strict") {
