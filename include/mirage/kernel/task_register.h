@@ -210,6 +210,10 @@ public:
   // DeepSeek V4-Flash MLA decode (v1: SWA-only, compress_ratio=0)
   int register_mla_v4_decode_sm100_task(threadblock::Graph const &bgraph,
                                         std::vector<int> const &params);
+  // DeepSeek V4-Flash Compressor compress step (Wave-2 sub-batch C2):
+  // gated-softmax pool + RMSNorm + RoPE + per-block FP8 quant + paged write.
+  int register_compressor_compress_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
   // SM100 tasks end
   // Multi-GPU tasks
   int register_nvshmem_allgather_strided_put_task(

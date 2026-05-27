@@ -485,6 +485,13 @@ void register_mugraph(
               task.task_metadata.token_offset = bid.x;
               task.task_metadata.num_tokens_per_task = 1;
             }
+            // DeepSeek V4-Flash Compressor compress step:
+            // grid=(num_compressed_tokens,), one CTA per boundary token.
+            // token_offset = bid.x; num_tokens_per_task = 1.
+            if (task_type == TASK_COMPRESSOR_COMPRESS_SM100) {
+              task.task_metadata.token_offset = bid.x;
+              task.task_metadata.num_tokens_per_task = 1;
+            }
             if (task_type == TASK_NVSHMEM_TILE_ALLREDUCE) {
               task.task_metadata.task_offset =
                   bid.x + bid.y * bgraph.grid_dim.x +
@@ -1892,6 +1899,8 @@ TaskGraphResult print_task_graph(
   task_type_to_name[TASK_MLA_V4_DECODE_SM100] = "TASK_MLA_V4_DECODE_SM100";
   task_type_to_name[TASK_INV_ROPE_FP8_QUANT_O_SM100] =
       "TASK_INV_ROPE_FP8_QUANT_O_SM100";
+  task_type_to_name[TASK_COMPRESSOR_COMPRESS_SM100] =
+      "TASK_COMPRESSOR_COMPRESS_SM100";
   task_type_to_name[TASK_MLA_V4_PREFILL_GATHER_SM100] =
       "TASK_MLA_V4_PREFILL_GATHER_SM100";
   task_type_to_name[TASK_COMPRESSOR_STATE_UPDATE_SM100] =

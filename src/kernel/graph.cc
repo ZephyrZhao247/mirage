@@ -871,6 +871,13 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     // 4 inputs (q, swa_cache, positions, attn_sink), 1 output (o)
     task_config[op] =
         std::make_tuple(4, 1, TASK_MLA_V4_DECODE_SM100, variant_id);
+  } else if (name == "compressor_compress_sm100") {
+    int variant_id = task_register->register_compressor_compress_sm100_task(
+        customized->bgraph, params);
+    // 5 inputs (state_cache, ape, cos_sin_cache, norm_weight, positions),
+    // 1 output (kv_cache).
+    task_config[op] =
+        std::make_tuple(5, 1, TASK_COMPRESSOR_COMPRESS_SM100, variant_id);
   }
   // MTP tasks
   else if (name == "mtp_verify_strict") {
