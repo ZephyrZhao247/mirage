@@ -35,6 +35,7 @@
 #include "mla_kv_cache_gather_split_sm100.cuh"
 // sm100_ptx.cuh must be included BEFORE mla_mtp_decode_sm100.cuh at top level
 // so kernel::sm100_ptx is defined in the correct namespace
+#include "compressor_state_update_sm100.cuh"
 #include "elementwise_add_sm100.cuh"
 #include "hash_route_lookup_sm100.cuh"
 #include "inv_rope_fp8_quant_o_sm100.cuh"

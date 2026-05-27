@@ -5345,6 +5345,87 @@ int TaskRegister::register_inv_rope_fp8_quant_o_sm100_task(
                                code.to_string());
 }
 
+int TaskRegister::register_compressor_state_update_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // V4-Flash Compressor state-update step: writes per-token (kv,
+  // score + ape) into a ring-buffer of "partial state" rows.
+  //
+  // Inputs (5):
+  //   kv           [T, HEAD_DIM]                bf16
+  //   score        [T, HEAD_DIM]                bf16
+  //   ape          [COMPRESS_RATIO, HEAD_DIM]   bf16 (learned)
+  //   positions    [T]                          int32
+  //   slot_mapping [T]                          int32
+  // Outputs (1, in-place semantics — caller passes the same buffer as
+  // an "output" so the runtime threads it through `output_ptrs[0]`):
+  //   state_cache  [num_slots, 2 * HEAD_DIM]    bf16
+  //
+  // params[0] = HEAD_DIM
+  // params[1] = COMPRESS_RATIO
+  // params[2] = overlap (0 or 1)
+  // num_tokens_per_task is fixed to 1 (one CTA per token).
+  assert(params.size() >= 3);
+  int head_dim = params[0];
+  int compress_ratio = params[1];
+  int overlap = params[2];
+
+  int const num_inputs = 5;
+  int const num_outputs = 1;
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  // Sanity-check shapes against the param-supplied constexpr values.
+  assert(input_ops[0]->dtensor.num_dims == 2);
+  int num_tokens_total = input_ops[0]->dtensor.dim[0];
+  assert(input_ops[0]->dtensor.dim[1] == head_dim);
+  assert(input_ops[1]->dtensor.num_dims == 2);
+  assert(input_ops[1]->dtensor.dim[0] == num_tokens_total);
+  assert(input_ops[1]->dtensor.dim[1] == head_dim);
+  assert(input_ops[2]->dtensor.num_dims == 2);
+  assert(input_ops[2]->dtensor.dim[0] == compress_ratio);
+  assert(input_ops[2]->dtensor.dim[1] == head_dim);
+  assert(input_ops[3]->dtensor.num_dims == 1);
+  assert(input_ops[3]->dtensor.dim[0] == num_tokens_total);
+  assert(input_ops[4]->dtensor.num_dims == 1);
+  assert(input_ops[4]->dtensor.dim[0] == num_tokens_total);
+  assert(output_ops[0]->dtensor.num_dims == 2);
+  assert(output_ops[0]->dtensor.dim[1] == 2 * head_dim);
+
+  // Use 128 threads (4 warps) per CTA. The kernel does plain strided
+  // writes so any NUM_THREADS that divides HEAD_DIM works; 128 matches
+  // WORKER_NUM_THREADS on Ampere and is sufficient for HEAD_DIM up to 512.
+  int const num_threads = 128;
+  std::string overlap_str = overlap ? "true" : "false";
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e(
+      "kernel::compressor_state_update_task_impl<$, $, $, $, bfloat16>(",
+      head_dim,
+      compress_ratio,
+      overlap_str,
+      num_threads);
+  code.e("    task_desc->input_ptrs[0],");  // kv
+  code.e("    task_desc->input_ptrs[1],");  // score
+  code.e("    task_desc->input_ptrs[2],");  // ape
+  code.e("    task_desc->input_ptrs[3],");  // positions
+  code.e("    task_desc->input_ptrs[4],");  // slot_mapping
+  code.e("    task_desc->output_ptrs[0],"); // state_cache (in-place)
+  code.e("    task_desc->task_metadata.token_offset,");
+  code.e("    1,"); // num_tokens_per_task = 1
+  code.e("    $);", num_tokens_total);
+  return register_task_variant(TASK_COMPRESSOR_STATE_UPDATE_SM100,
+                               code.to_string());
+}
+
 int TaskRegister::register_mla_v4_decode_sm100_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
   // DeepSeek V4-Flash MLA decode (v1: SWA-only, compress_ratio=0).
