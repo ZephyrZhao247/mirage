@@ -46,9 +46,13 @@ import torch.nn.functional as F
 
 from ...context import current_pk
 from ...layers import (
+    AllReduce,
     ArgmaxPartial,
     ArgmaxReduce,
+    AssembleQDecode,
     Embed,
+    FP8GroupGEMMSmallM,
+    FusedRMSNormQuantizeFP8,
     Linear,
     LinearWithResidual,
     MPKModule,
@@ -58,13 +62,53 @@ from ...layers import (
     MLARopeK,
     MLARopeQ,
     MoeMulSumAdd,
+    MoEPermute,
     MoESiluMul,
     MoETopkRouting,
+    MoEUnpermute,
     MoEW13,
     MoEW2,
+    QuantizeFP8F32Scale,
+    QuantizeFP8UE8M0,
     RMSNorm,
     RotaryEmbedding,
+    TransposeScale,
 )
+from ...layers.linear.linear_fp8 import _dequant_fp8
+
+
+def _packed_scale_k(reduction_size: int) -> int:
+    """UE8M0 packed-scale K count: ceil(ceil(K/128)/4) (4 bytes/uint32)."""
+    num_groups = (reduction_size + 127) // 128
+    return (num_groups + 3) // 4
+
+
+def _dequant_fp8_blockwise(w_fp8, scale_f32, block: int = 128):
+    """Dequant an FP8 weight ``(N, K)`` with a 128x128-block f32 scale
+    ``(N//block, K//block)`` to fp32 ``(N, K)`` — the layout
+    ``fp8_gemm_dense_smallm`` expects for ``weight_scale`` (DeepSeek V3
+    native FP8 weight quantization)."""
+    w = (w_fp8.view(torch.float8_e4m3fn) if w_fp8.dtype == torch.uint8
+         else w_fp8).float()
+    N, K = w.shape
+    nb, kb = N // block, K // block
+    return (w.reshape(nb, block, kb, block)
+            * scale_f32.reshape(nb, 1, kb, 1)).reshape(N, K)
+
+
+def _swapab_grid(out_features: int, num_workers: int) -> int:
+    """grid.x for an FP8 swapAB GEMM: largest divisor of ``out_features//128``
+    that is ``<= num_workers``, so per-task output is a 128-multiple
+    (MMA_M=128) and grid.x divides the output cleanly.
+    """
+    if out_features % 128 != 0:
+        raise ValueError(f"swapAB out_features={out_features} must be %128==0")
+    blocks = out_features // 128
+    g = 1
+    for d in range(1, blocks + 1):
+        if blocks % d == 0 and d <= num_workers:
+            g = d
+    return g
 
 
 # ---------------------------------------------------------------------------
@@ -487,34 +531,69 @@ class DeepseekV3MLA(MPKModule):
 
 
 class DeepseekV3MLP(MPKModule):
-    """Dense gated MLP (qwen3-style): gate+up fused via ``shuffle_tensors``,
-    then silu_mul, then down_proj + residual. BF16.
+    """Dense gated MLP in FP8 (decode), HF-faithful reference.
 
-    This mirrors :class:`mirage.mpk.models.qwen3.modeling.Qwen3MLP` exactly,
-    using the dense ``intermediate_size`` for layers 0..first_k_dense_replace-1.
+    Mirrors HF ``DeepseekV3MLP.forward``: ``down(silu(gate(x)) * up(x))``
+    (+ residual). The ``compile`` path is FP8 on SM100:
+
+      1. ``QuantizeFP8UE8M0`` the input → ``(x_fp8, x_scale)``.
+      2. ONE FP8 swapAB GEMM over the **concat-fused** ``gate_up`` weight
+         (rows ``[0:I]`` = gate, ``[I:2I]`` = up) → ``(mbt, 2I)`` whose
+         columns are therefore ``[gate(I) | up(I)]``.
+      3. ``silu_mul`` with ``grid.x = 1`` (plain halved ``[gate|up]`` layout,
+         no per-task interleave) → ``(mbt, I)``.
+      4. ``QuantizeFP8UE8M0`` the silu output, then a swapAB GEMM over the
+         ``down`` weight with the bf16 residual fused → ``(mbt, hidden)``.
+
+    Used both as the dense MLP (``intermediate_size``) for layers
+    ``0..first_k_dense_replace-1`` and as the shared expert
+    (``moe_intermediate_size * n_shared_experts``) inside the MoE block.
+
+    Weights are stored as raw FP8 ``uint8`` + UE8M0-packed ``uint32`` scales;
+    the driver produces the concat-fused ``gate_up`` weight at load time.
     """
 
-    def __init__(self, config, *, prefix: str = ""):
+    def __init__(self, config, *, intermediate_size=None, prefix: str = ""):
         super().__init__(prefix=prefix)
         self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.gate_proj_weight = nn.Parameter(
-            torch.empty(self.intermediate_size, self.hidden_size)
+        self.intermediate_size = (
+            intermediate_size if intermediate_size is not None
+            else config.intermediate_size
         )
-        self.up_proj_weight = nn.Parameter(
-            torch.empty(self.intermediate_size, self.hidden_size)
+        H, I = self.hidden_size, self.intermediate_size
+
+        # Concat-fused gate_up: rows [0:I]=gate, [I:2I]=up. FP8 E4M3 (uint8)
+        # + 128x128-block f32 weight scale (DeepSeek V3 native FP8 layout,
+        # consumed by fp8_gemm_dense_smallm).
+        self.gate_up_weight = nn.Parameter(
+            torch.empty(2 * I, H, dtype=torch.uint8), requires_grad=False
         )
-        self.down_proj_weight = nn.Parameter(
-            torch.empty(self.hidden_size, self.intermediate_size)
+        self.gate_up_scale = nn.Parameter(
+            torch.empty(2 * I // 128, H // 128, dtype=torch.float32),
+            requires_grad=False,
         )
+        self.down_weight = nn.Parameter(
+            torch.empty(H, I, dtype=torch.uint8), requires_grad=False
+        )
+        self.down_scale = nn.Parameter(
+            torch.empty(H // 128, I // 128, dtype=torch.float32),
+            requires_grad=False,
+        )
+
+        # Activation quantizers (f32 1x128 scale → fp8_gemm_dense_smallm).
+        self.q_in = QuantizeFP8F32Scale(H, prefix=f"{prefix}q_in_")
+        self.q_silu = QuantizeFP8F32Scale(I, prefix=f"{prefix}q_silu_")
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata,
                               strict, missing_keys, unexpected_keys,
                               error_msgs):
+        # The driver pre-builds the concat-fused FP8 gate_up + 128x128 scale
+        # and the FP8 down + scale under these keys.
         for hf_name, param in [
-            ("gate_proj.weight", self.gate_proj_weight),
-            ("up_proj.weight", self.up_proj_weight),
-            ("down_proj.weight", self.down_proj_weight),
+            ("gate_up_proj.weight", self.gate_up_weight),
+            ("gate_up_proj.weight_scale_inv", self.gate_up_scale),
+            ("down_proj.weight", self.down_weight),
+            ("down_proj.weight_scale_inv", self.down_scale),
         ]:
             hf_key = prefix + hf_name
             if hf_key in state_dict:
@@ -526,10 +605,15 @@ class DeepseekV3MLP(MPKModule):
         )
 
     def forward(self, x, residual):
-        gate = F.linear(x, self.gate_proj_weight)
-        up = F.linear(x, self.up_proj_weight)
-        silu_out = (F.silu(gate.float()) * up.float()).to(x.dtype)
-        return F.linear(silu_out, self.down_proj_weight) + residual
+        """HF reference, dequantizing the stored FP8 weights (fp32 math)."""
+        I = self.intermediate_size
+        gu = _dequant_fp8_blockwise(self.gate_up_weight, self.gate_up_scale)
+        gate = F.linear(x.float(), gu[:I])
+        up = F.linear(x.float(), gu[I:])
+        silu = F.silu(gate) * up
+        dn = _dequant_fp8_blockwise(self.down_weight, self.down_scale)
+        out = F.linear(silu, dn) + residual.float()
+        return out.to(x.dtype)
 
     def auto_grid_dim(self, *args, **kwargs):
         raise NotImplementedError("composite — see child compile()s")
@@ -538,56 +622,57 @@ class DeepseekV3MLP(MPKModule):
         pk = current_pk()
         from ....core import bfloat16 as _mi_bf16
 
-        fused_out = 2 * self.intermediate_size
-        num_tasks_linear = _grid_for_linear(fused_out)
+        mbt = pk.max_num_batched_tokens
+        H, I = self.hidden_size, self.intermediate_size
+        nw = pk.num_workers
 
-        w_gate_dt = pk.attach_input(
-            self.gate_proj_weight, name=f"{self.prefix}gate_proj_weight"
+        # 1. quantize input → FP8 + f32 1x128 scale (M, H/128).
+        x_fp8, x_scale = self.q_in.compile(x_dt)
+
+        # 2. gate_up dense GEMM (concat-fused weight) → (mbt, 2I) = [gate|up].
+        w_gu = pk.attach_input(
+            self.gate_up_weight, name=f"{self.prefix}gate_up_weight"
         )
-        w_up_dt = pk.attach_input(
-            self.up_proj_weight, name=f"{self.prefix}up_proj_weight"
+        ws_gu = pk.attach_input(
+            self.gate_up_scale, name=f"{self.prefix}gate_up_scale"
         )
-        w_gateup_dt = pk.shuffle_tensors(
-            inputs=[w_gate_dt, w_up_dt],
-            shuffled_dim=0,
-            num_groups=num_tasks_linear // 2,
-            name=f"{self.prefix}gateup_proj",
+        mlp_mid = pk.new_tensor(
+            dims=(mbt, 2 * I), dtype=_mi_bf16, name=f"{self.prefix}mlp_mid",
+        )
+        pk.fp8_gemm_dense_smallm_layer(
+            input_fp8=x_fp8, weight_fp8=w_gu,
+            input_scale=x_scale, weight_scale=ws_gu,
+            output=mlp_mid, num_workers=nw,
         )
 
-        per_layer_mlp_mid = pk.new_tensor(
-            dims=(pk.max_num_batched_tokens, fused_out),
-            dtype=_mi_bf16,
-            name=f"{self.prefix}per_layer_mlp_mid",
-        )
-        pk.linear_layer(
-            input=x_dt,
-            weight=w_gateup_dt,
-            output=per_layer_mlp_mid,
-            grid_dim=(num_tasks_linear, 1, 1),
-            block_dim=(128, 1, 1),
-        )
-        per_layer_silu_mul_out = pk.new_tensor(
-            dims=(pk.max_num_batched_tokens, self.intermediate_size),
-            dtype=_mi_bf16,
-            name=f"{self.prefix}per_layer_silu_mul_out",
+        # 3. silu_mul (grid.x=1 → plain [gate|up] halved layout).
+        silu_out = pk.new_tensor(
+            dims=(mbt, I), dtype=_mi_bf16, name=f"{self.prefix}silu_out",
         )
         pk.silu_mul_layer(
-            input=per_layer_mlp_mid,
-            output=per_layer_silu_mul_out,
-            grid_dim=(num_tasks_linear // 2, 1, 1),
-            block_dim=(128, 1, 1),
+            input=mlp_mid, output=silu_out,
+            grid_dim=(1, 1, 1), block_dim=(128, 1, 1),
         )
 
-        w_down_dt = pk.attach_input(
-            self.down_proj_weight, name=f"{self.prefix}down_proj_weight"
+        # 4. quantize silu output, down dense GEMM → partial, + residual.
+        silu_fp8, silu_scale = self.q_silu.compile(silu_out)
+        w_dn = pk.attach_input(
+            self.down_weight, name=f"{self.prefix}down_weight"
         )
-        pk.linear_with_residual_layer(
-            input=per_layer_silu_mul_out,
-            weight=w_down_dt,
-            residual=residual_dt,
-            output=output,
-            grid_dim=(self.hidden_size // 64, 1, 1),
-            block_dim=(128, 1, 1),
+        ws_dn = pk.attach_input(
+            self.down_scale, name=f"{self.prefix}down_scale"
+        )
+        partial = pk.new_tensor(
+            dims=(mbt, H), dtype=_mi_bf16, name=f"{self.prefix}down_partial",
+        )
+        pk.fp8_gemm_dense_smallm_layer(
+            input_fp8=silu_fp8, weight_fp8=w_dn,
+            input_scale=silu_scale, weight_scale=ws_dn,
+            output=partial, num_workers=nw,
+        )
+        pk.elementwise_add_layer(
+            input_a=partial, input_b=residual_dt, output=output,
+            grid_dim=(mbt, 1, 1), block_dim=(128, 1, 1),
         )
         return output
 
@@ -597,328 +682,207 @@ class DeepseekV3MLP(MPKModule):
 # ---------------------------------------------------------------------------
 
 
-class DeepseekV3MoEMLP(MPKModule):
-    """MoE MLP: sigmoid-routed top-k experts + shared expert + residual.
+class DeepseekV3MoE(MPKModule):
+    """DeepSeek V3 MoE block (HF ``DeepseekV3MoE``), FP8 permute-based path.
 
-    Pipeline:
-        1. Router: ``Linear(hidden -> num_experts)`` producing logits in
-           BF16; sigmoid-based top-k routing with per-expert
-           ``e_score_correction_bias``, group-limited gating
-           (``num_groups=8``, ``topk_group=4``), and
-           ``routed_scaling_factor=2.5``.
-        2. Routed experts: per-expert W13 (gate + up fused) → silu_mul →
-           W2 down-projection. BF16. Weights are stacked into ``experts.w13``
-           / ``experts.w2`` 3D tensors at load time.
-        3. Shared expert (one expert in DeepSeek V3): same dense
-           gate/up/silu/down pattern as :class:`DeepseekV3MLP` but with
-           ``moe_intermediate_size`` instead of dense ``intermediate_size``.
-        4. Combine: ``MoeMulSumAdd`` performs
-           ``out = shared_out + sum_k(routed_k * topk_weight_k)`` and adds
-           the layer residual via the shared-expert path's residual chain.
+    ``forward`` mirrors HF: router gate -> per-expert routed loop ->
+    ``+ shared_experts(x)``, with the transformer residual folded into the
+    shared-expert output (so the decoder layer must NOT re-add it).
+    ``compile`` builds the validated grouped-GEMM permute pipeline (see
+    ``tests/runtime_python/test_mode/test_dsv3_moe_permute_chain_testmode.py``):
+
+        router GEMM (bf16) -> MoETopkRouting(sigmoid) -> QuantizeFP8(ue8m0)
+        -> MoEPermute -> FP8GroupGEMM(w13) -> MoESiluMul -> QuantizeFP8(ue8m0)
+        -> FP8GroupGEMM(w2) -> [shared expert = DeepseekV3MLP] ->
+        MoEUnpermute(routed combine + shared_out).
+
+    TP/EP-aware: ``ep_size`` (from the parallel config) shards the routed
+    experts (``local_num_experts = n_routed_experts // ep_size``). v1 is
+    tested at ``ep_size == 1`` (single GPU).
     """
 
     def __init__(self, config, *, prefix: str = ""):
         super().__init__(prefix=prefix)
-        self.hidden_size = config.hidden_size
-        self.moe_intermediate_size = config.moe_intermediate_size
-        self.num_experts = config.n_routed_experts
+        pc = current_pk().parallel_config
+        self.ep_size = getattr(pc, "ep_size", 1)
+        ep_rank = getattr(pc, "ep_rank", 0)
+        self.hidden_size = H = config.hidden_size
+        self.moe_intermediate_size = I = config.moe_intermediate_size
+        self.num_experts = E = config.n_routed_experts
         self.num_experts_per_tok = config.num_experts_per_tok
         self.num_shared_experts = getattr(config, "n_shared_experts", 1)
         self.num_groups = getattr(config, "n_group", 8)
         self.topk_group = getattr(config, "topk_group", 4)
-        self.routed_scaling_factor = getattr(
-            config, "routed_scaling_factor", 2.5
-        )
+        self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 2.5)
+        self.bm_padding = 128
+        self.local_num_experts = E // self.ep_size
+        self.local_expert_start = ep_rank * self.local_num_experts
+        self._m_total = self.local_num_experts * self.bm_padding
 
-        # ---- Router parameters ----------------------------------------
-        # Note: HF stores ``mlp.gate.weight`` in shape (num_experts, hidden).
-        self.gate_weight = nn.Parameter(
-            torch.empty(self.num_experts, self.hidden_size)
-        )
-        # Catalog MoETopkRouting owns the e_score_correction_bias via its
-        # ``bias`` parameter; we don't duplicate it here.
+        # Router (bf16) + group-limited sigmoid routing (owns e_score bias).
+        self.gate_weight = nn.Parameter(torch.empty(E, H))
         self.routing = MoETopkRouting(
-            num_experts=self.num_experts,
-            num_experts_per_tok=self.num_experts_per_tok,
-            variant="sigmoid",
-            num_groups=self.num_groups,
+            num_experts=E, num_experts_per_tok=self.num_experts_per_tok,
+            variant="sigmoid", num_groups=self.num_groups,
             topk_group=self.topk_group,
             routed_scaling_factor=self.routed_scaling_factor,
-            local_num_experts=self.num_experts,
-            local_expert_start=0,
-            prefix=f"{prefix}routing_",
-        )
+            local_num_experts=self.local_num_experts,
+            local_expert_start=self.local_expert_start, prefix=f"{prefix}gate_")
+        # Routed experts: own FP8 (E_local, N, K) weights + K-outer scales.
+        self.experts_w13 = FP8GroupGEMMSmallM(
+            self.local_num_experts, in_features=H, out_features=2 * I,
+            prefix=f"{prefix}experts_w13_")
+        self.experts_silu = MoESiluMul(I, prefix=f"{prefix}experts_silu_")
+        self.experts_w2 = FP8GroupGEMMSmallM(
+            self.local_num_experts, in_features=I, out_features=H,
+            prefix=f"{prefix}experts_w2_")
+        self.permute = MoEPermute(
+            self.local_num_experts, H, self.num_experts_per_tok,
+            bm_padding=self.bm_padding, prefix=f"{prefix}permute_")
+        self.unpermute = MoEUnpermute(H, prefix=f"{prefix}unpermute_")
+        # Shared expert (DeepseekV3MLP with moe_int * n_shared).
+        self.shared_experts = DeepseekV3MLP(
+            config, intermediate_size=I * self.num_shared_experts,
+            prefix=f"{prefix}shared_experts_")
+        self.register_buffer(
+            "m_indices",
+            torch.arange(self._m_total, dtype=torch.int32) // self.bm_padding,
+            persistent=False)
 
-        # ---- Routed experts (catalog leaves own the 3D weight tensors) ----
-        self.w13 = MoEW13(
-            num_experts=self.num_experts,
-            num_experts_per_tok=self.num_experts_per_tok,
-            hidden_size=self.hidden_size,
-            intermediate_size=self.moe_intermediate_size,
-            dtype="bf16",
-            prefix=f"{prefix}experts_w13_",
-        )
-        self.silu_mul = MoESiluMul(
-            intermediate_size=self.moe_intermediate_size,
-            prefix=f"{prefix}experts_silu_mul_",
-        )
-        self.w2 = MoEW2(
-            num_experts=self.num_experts,
-            num_experts_per_tok=self.num_experts_per_tok,
-            hidden_size=self.hidden_size,
-            intermediate_size=self.moe_intermediate_size,
-            dtype="bf16",
-            prefix=f"{prefix}experts_w2_",
-        )
-        self.combine = MoeMulSumAdd(
-            hidden_size=self.hidden_size,
-            num_experts_per_tok=self.num_experts_per_tok,
-            prefix=f"{prefix}combine_",
-        )
-
-        # ---- Shared expert (1 expert in DeepSeek V3) ----------------
-        self.shared_gate_proj_weight = nn.Parameter(
-            torch.empty(self.moe_intermediate_size, self.hidden_size)
-        )
-        self.shared_up_proj_weight = nn.Parameter(
-            torch.empty(self.moe_intermediate_size, self.hidden_size)
-        )
-        self.shared_down_proj_weight = nn.Parameter(
-            torch.empty(self.hidden_size, self.moe_intermediate_size)
-        )
-
-    # ------------------------------------------------------------------
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata,
-                              strict, missing_keys, unexpected_keys,
-                              error_msgs):
-        # Router weight and bias. HF stores:
-        #   ``mlp.gate.weight``                   (num_experts, hidden)
-        #   ``mlp.gate.e_score_correction_bias``  (num_experts,)
-        gate_key = prefix + "gate.weight"
-        if gate_key in state_dict:
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        gk = prefix + "gate.weight"
+        if gk in state_dict:
             with torch.no_grad():
-                self.gate_weight.copy_(state_dict.pop(gate_key))
-        bias_key = prefix + "gate.e_score_correction_bias"
-        if bias_key in state_dict:
+                self.gate_weight.copy_(state_dict.pop(gk))
+        bk = prefix + "gate.e_score_correction_bias"
+        if bk in state_dict:
             with torch.no_grad():
-                # MoETopkRouting stores its bias in fp32.
-                self.routing.bias.copy_(
-                    state_dict.pop(bias_key).to(torch.float32)
-                )
-
-        # Routed experts: caller is responsible for producing the stacked
-        # 3D weights ``experts.w13.weight`` (num_experts, 2*moe_inter, hidden)
-        # and ``experts.w2.weight`` (num_experts, hidden, moe_inter) before
-        # calling load_state_dict. demo_new.py's
-        # ``_load_hf_weights_with_absorption`` handles the stacking.
-        w13_key = prefix + "experts.w13.weight"
-        if w13_key in state_dict:
-            with torch.no_grad():
-                self.w13.weight.copy_(state_dict.pop(w13_key))
-        w2_key = prefix + "experts.w2.weight"
-        if w2_key in state_dict:
-            with torch.no_grad():
-                self.w2.weight.copy_(state_dict.pop(w2_key))
-
-        # Shared expert weights.
-        for hf_name, param in [
-            ("shared_experts.gate_proj.weight", self.shared_gate_proj_weight),
-            ("shared_experts.up_proj.weight", self.shared_up_proj_weight),
-            ("shared_experts.down_proj.weight", self.shared_down_proj_weight),
+                self.routing.bias.copy_(state_dict.pop(bk).to(torch.float32))
+        # Driver pre-stacks + UE8M0-packs the routed expert weights.
+        for hf, p in [
+            ("experts.w13.weight", self.experts_w13.weight),
+            ("experts.w13.weight_scale", self.experts_w13.weight_scale),
+            ("experts.w2.weight", self.experts_w2.weight),
+            ("experts.w2.weight_scale", self.experts_w2.weight_scale),
         ]:
-            hf_key = prefix + hf_name
-            if hf_key in state_dict:
+            k = prefix + hf
+            if k in state_dict:
                 with torch.no_grad():
-                    param.copy_(state_dict.pop(hf_key))
+                    p.copy_(state_dict.pop(k))
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict, missing_keys,
-            unexpected_keys, error_msgs
-        )
+            unexpected_keys, error_msgs)
 
-    def forward(self, *args, **kwargs):
-        raise NotImplementedError(
-            "DeepseekV3MoEMLP.forward() is not implemented in the MPK "
-            "catalog. Use transformers.DeepseekV3ForCausalLM as oracle."
-        )
+    def _dequant_group(self, gg, block: int = 128):
+        """Dequant a FP8GroupGEMMSmallM's owned (E,N,K) weight to fp32 — same
+        math as :meth:`FP8GroupGEMMSmallM.forward`'s SFB path."""
+        E, N, K = gg.num_experts, gg.out_features, gg.in_features
+        nk = K // block
+        num_sf_k = (nk + 3) // 4
+        w = gg.weight.view(torch.float8_e4m3fn).float()
+        sfb = gg.weight_scale.view(num_sf_k, E, N).permute(1, 2, 0).contiguous()
+        sfb_bytes = sfb.view(torch.uint8).reshape(E, N, num_sf_k * 4)[..., :nk]
+        sfb_f32 = torch.pow(torch.tensor(2.0, device=w.device),
+                            sfb_bytes.float() - 127.0)
+        sfb_exp = sfb_f32.repeat_interleave(block, dim=-1)[..., :K]
+        return w * sfb_exp
+
+    def forward(self, x, residual):
+        """HF reference: gate -> routed loop -> + shared(x) (+ residual)."""
+        H, I = self.hidden_size, self.moe_intermediate_size
+        topk = self.num_experts_per_tok
+        x2 = x.view(-1, H)
+        res2 = residual.view(-1, H)
+        M = x2.shape[0]
+        logits = F.linear(x2.float(), self.gate_weight.float())
+        topk_w, routing_indices, _ = self.routing.forward(logits)
+        ri = routing_indices  # (E_local, M)
+        w13 = self._dequant_group(self.experts_w13)  # (E_local, 2I, H)
+        w2 = self._dequant_group(self.experts_w2)    # (E_local, H, I)
+        routed = torch.zeros(M, H, dtype=torch.float32, device=x.device)
+        for e in range(self.local_num_experts):
+            for t in range(M):
+                s = int(ri[e, t].item())
+                if s <= 0:
+                    continue
+                gu = x2[t].float() @ w13[e].t()
+                act = F.silu(gu[:I]) * gu[I:]
+                routed[t] += topk_w[t, s - 1].item() * (act @ w2[e].t())
+        shared = self.shared_experts.forward(x2, res2)  # shared(x) + residual
+        return (routed.to(x.dtype) + shared).view_as(x)
 
     def auto_grid_dim(self, *args, **kwargs):
         raise NotImplementedError("composite — see child compile()s")
 
-    # ------------------------------------------------------------------
-    def compile(self, x_dt, *, residual_dt, output):
-        """Build the MoE task graph for one decoder layer.
-
-        Args:
-            x_dt: input DTensor of shape ``(mbt, hidden)`` (post-RMSnorm).
-            residual_dt: residual DTensor for the shared-expert path.
-            output: destination DTensor for the MoE block output
-                ``(mbt, hidden)``.
-        """
+    def compile(self, x_dt, residual_dt, *, output):
         pk = current_pk()
-        from ....core import bfloat16 as _mi_bf16, float32 as _mi_f32, int32 as _mi_i32
-
+        from ....core import (bfloat16 as _bf16, float8_e4m3 as _fp8,
+                              float32 as _f32, uint32 as _u32, int32 as _i32)
         mbt = pk.max_num_batched_tokens
-        H = self.hidden_size
-        E = self.num_experts
-        K = self.num_experts_per_tok
-        I = self.moe_intermediate_size
+        H, I, E = self.hidden_size, self.moe_intermediate_size, self.num_experts
+        E_local = self.local_num_experts
+        topk = self.num_experts_per_tok
+        m_total = self._m_total
+        K_PACKED = _packed_scale_k(H)
+        K_PACKED_I = _packed_scale_k(I)
+        nw = pk.num_workers
+        p = self.prefix
 
-        # ---- 1. Router : Linear x w_gate -> router_logits ------------
-        w_gate_dt = pk.attach_input(
-            self.gate_weight, name=f"{self.prefix}moe_gate_weight"
-        )
-        router_logits = pk.new_tensor(
-            dims=(mbt, E),
-            dtype=_mi_bf16,
-            name=f"{self.prefix}router_logits",
-        )
-        # Router GEMM is small (E=256, hidden=7168). Pick grid_x = E // 8
-        # (the deepseek builder's heuristic for routers) but cap to the
-        # demo-friendly _grid_for_linear / 8 pattern.
-        router_grid = min(_grid_for_linear(E), E // 8)
-        pk.linear_layer(
-            input=x_dt,
-            weight=w_gate_dt,
-            output=router_logits,
-            grid_dim=(router_grid, 1, 1),
-            block_dim=(128, 1, 1),
-        )
-
-        # ---- 2. Top-k sigmoid routing -------------------------------
-        moe_topk_weights = pk.new_tensor(
-            dims=(mbt, K), dtype=_mi_f32,
-            name=f"{self.prefix}moe_topk_weights",
-        )
-        moe_routing_indices = pk.new_tensor(
-            dims=(E, mbt), dtype=_mi_i32,
-            name=f"{self.prefix}moe_routing_indices",
-        )
-        moe_mask = pk.new_tensor(
-            dims=(E + 1,), dtype=_mi_i32,
-            name=f"{self.prefix}moe_mask",
-        )
-        self.routing.compile(
-            router_logits, moe_topk_weights, moe_routing_indices, moe_mask
-        )
-
-        # ---- 3. W13 (gate+up fused) ---------------------------------
-        moe_mid = pk.new_tensor(
-            dims=(mbt, K, 2 * I),
-            dtype=_mi_bf16,
-            name=f"{self.prefix}moe_mid",
-        )
-        self.w13.compile(
-            x=x_dt,
-            routing_indices=moe_routing_indices,
-            mask=moe_mask,
-            output=moe_mid,
-        )
-
-        # ---- 4. SiLU-Mul on the 3D layout ---------------------------
-        moe_silu = pk.new_tensor(
-            dims=(mbt, K, I),
-            dtype=_mi_bf16,
-            name=f"{self.prefix}moe_silu",
-        )
-        self.silu_mul.compile(
-            gateup=moe_mid,
-            output=moe_silu,
-            # The kernel grid for OLD MoE is (mbt, K, 1).
-            grid_dim=(mbt, K, 1),
-            block_dim=(128, 1, 1),
-        )
-
-        # ---- 5. W2 (down) -------------------------------------------
-        moe_down = pk.new_tensor(
-            dims=(mbt, K, H),
-            dtype=_mi_bf16,
-            name=f"{self.prefix}moe_down",
-        )
-        self.w2.compile(
-            x=moe_silu,
-            routing_indices=moe_routing_indices,
-            mask=moe_mask,
-            output=moe_down,
-        )
-
-        # ---- 6. Shared expert (dense gate+up fused + silu_mul + down) ----
-        # Same fused gate/up pattern as DeepseekV3MLP, but with
-        # moe_intermediate_size instead of intermediate_size, and the
-        # residual is the layer input (residual_dt) so the shared-expert
-        # output already contains (residual + shared_expert(x)).
-        w_shared_gate_dt = pk.attach_input(
-            self.shared_gate_proj_weight,
-            name=f"{self.prefix}shared_gate_proj_weight",
-        )
-        w_shared_up_dt = pk.attach_input(
-            self.shared_up_proj_weight,
-            name=f"{self.prefix}shared_up_proj_weight",
-        )
-        shared_fused_out = 2 * I
-        shared_linear_grid = _grid_for_linear(shared_fused_out)
-        w_shared_gateup_dt = pk.shuffle_tensors(
-            inputs=[w_shared_gate_dt, w_shared_up_dt],
-            shuffled_dim=0,
-            num_groups=shared_linear_grid // 2,
-            name=f"{self.prefix}shared_gateup_proj",
-        )
-        shared_mid = pk.new_tensor(
-            dims=(mbt, shared_fused_out),
-            dtype=_mi_bf16,
-            name=f"{self.prefix}shared_mid",
-        )
-        pk.linear_layer(
-            input=x_dt,
-            weight=w_shared_gateup_dt,
-            output=shared_mid,
-            grid_dim=(shared_linear_grid, 1, 1),
-            block_dim=(128, 1, 1),
-        )
-        shared_silu = pk.new_tensor(
-            dims=(mbt, I),
-            dtype=_mi_bf16,
-            name=f"{self.prefix}shared_silu",
-        )
-        pk.silu_mul_layer(
-            input=shared_mid,
-            output=shared_silu,
-            grid_dim=(shared_linear_grid // 2, 1, 1),
-            block_dim=(128, 1, 1),
-        )
-        w_shared_down_dt = pk.attach_input(
-            self.shared_down_proj_weight,
-            name=f"{self.prefix}shared_down_proj_weight",
-        )
-        # shared_residual = shared_down(shared_silu) + residual_dt
-        shared_residual = pk.new_tensor(
-            dims=(mbt, H),
-            dtype=_mi_bf16,
-            name=f"{self.prefix}shared_residual",
-        )
-        pk.linear_with_residual_layer(
-            input=shared_silu,
-            weight=w_shared_down_dt,
-            residual=residual_dt,
-            output=shared_residual,
-            grid_dim=(H // 64, 1, 1),
-            block_dim=(128, 1, 1),
-        )
-
-        # ---- 7. MoeMulSumAdd : combine routed experts + shared residual ----
-        self.combine.compile(
-            x=moe_down,
-            topk_weights=moe_topk_weights,
-            residual=shared_residual,
-            output=output,
-            grid_dim=(mbt, _moe_hidden_split(H), 1),
-            block_dim=(128, 1, 1),
-        )
+        # 1. router GEMM (bf16).
+        w_gate = pk.attach_input(self.gate_weight, name=f"{p}gate_weight")
+        logits = pk.new_tensor(dims=(mbt, E), dtype=_bf16, name=f"{p}router_logits")
+        rg = max(1, min(_grid_for_linear(E) if E % 64 == 0 else 1, max(1, E // 8)))
+        pk.linear_layer(input=x_dt, weight=w_gate, output=logits,
+                        grid_dim=(rg, 1, 1), block_dim=(128, 1, 1))
+        # 2. routing.
+        topk_w = pk.new_tensor(dims=(mbt, topk), dtype=_f32, name=f"{p}topk_w")
+        routing_idx = pk.new_tensor(dims=(E_local, mbt), dtype=_i32, name=f"{p}routing_idx")
+        moe_mask = pk.new_tensor(dims=(E_local + 1,), dtype=_i32, name=f"{p}moe_mask")
+        self.routing.compile(logits, topk_w, routing_idx, moe_mask)
+        # 3. quantize input (UE8M0).
+        in_fp8 = pk.new_tensor(dims=(mbt, H), dtype=_fp8, name=f"{p}in_fp8")
+        in_scale = pk.new_tensor(dims=(mbt, K_PACKED), dtype=_u32, name=f"{p}in_scale")
+        pk.quantize_fp8_layer(input=x_dt, output_fp8=in_fp8, output_scale=in_scale,
+                              grid_dim=(mbt, 1, 1), block_dim=(128, 1, 1),
+                              scale_ue8m0=True)
+        # 4. meta + permute.
+        meta = pk.new_tensor(dims=(2, m_total + mbt * topk), dtype=_i32, name=f"{p}meta")
+        pk.tensor_init_layer(target=meta, dummy=in_fp8, grid_dim=(1, 1, 1),
+                             block_dim=(128, 1, 1), dummy_input_map=(-1, -1, -1),
+                             target_input_map=(-1, -1, -1))
+        perm_fp8 = pk.new_tensor(dims=(m_total, H), dtype=_fp8, name=f"{p}perm_fp8")
+        perm_scale = pk.new_tensor(dims=(K_PACKED, m_total), dtype=_u32, name=f"{p}perm_scale")
+        self.permute.compile(in_fp8, in_scale, topk_w, routing_idx,
+                             perm_fp8, perm_scale, meta)
+        # 5. w13 group GEMM.
+        m_idx = pk.attach_input(self.m_indices, name=f"{p}m_indices")
+        w13_out = pk.new_tensor(dims=(m_total, 2 * I), dtype=_bf16, name=f"{p}w13_out")
+        self.experts_w13.compile(perm_fp8, perm_scale, m_idx, w13_out, num_workers=nw)
+        # 6. silu_mul.
+        silu_out = pk.new_tensor(dims=(m_total, I), dtype=_bf16, name=f"{p}silu_out")
+        self.experts_silu.compile(w13_out, output=silu_out)
+        # 7. quantize silu (UE8M0, K-outer (K_PACKED_I, m_total)).
+        silu_fp8 = pk.new_tensor(dims=(m_total, I), dtype=_fp8, name=f"{p}silu_fp8")
+        silu_scale = pk.new_tensor(dims=(K_PACKED_I, m_total), dtype=_u32, name=f"{p}silu_scale")
+        pk.quantize_fp8_layer(input=silu_out, output_fp8=silu_fp8,
+                              output_scale=silu_scale, grid_dim=(m_total, 1, 1),
+                              block_dim=(128, 1, 1), scale_ue8m0=True,
+                              process_all_rows=True)
+        # 8. w2 group GEMM.
+        w2_out = pk.new_tensor(dims=(m_total, H), dtype=_bf16, name=f"{p}w2_out")
+        self.experts_w2.compile(silu_fp8, silu_scale, m_idx, w2_out, num_workers=nw)
+        # 9. shared expert (DeepseekV3MLP: shared(x) + residual).
+        shared_out = pk.new_tensor(dims=(mbt, H), dtype=_bf16, name=f"{p}shared_out")
+        self.shared_experts.compile(x_dt, residual_dt, output=shared_out)
+        # 10. unpermute: output = shared_out + routed-combine.
+        self.unpermute.compile(permuted_output=w2_out, meta=meta,
+                               residual=shared_out, output=output)
         return output
 
 
-# ---------------------------------------------------------------------------
-# DeepseekV3DecoderLayer
-# ---------------------------------------------------------------------------
+# Backward-compat alias (decoder layer references the old name until rewritten).
+DeepseekV3MoEMLP = DeepseekV3MoE
 
 
 class DeepseekV3DecoderLayer(MPKModule):

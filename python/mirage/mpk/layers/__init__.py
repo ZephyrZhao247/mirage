@@ -30,6 +30,7 @@ from .embedding.embed import Embed
 # Normalization
 from .norm.rmsnorm import RMSNorm
 from .norm.rmsnorm_linear import RMSNormLinear
+from .norm.rmsnorm_quantize_fp8 import FusedRMSNormQuantizeFP8
 
 # Linear / GEMM
 from .linear.linear import Linear
@@ -154,6 +155,7 @@ __all__ = [
     # norm
     "RMSNorm",
     "RMSNormLinear",
+    "FusedRMSNormQuantizeFP8",
     # linear
     "Linear",
     "LinearWithResidual",
