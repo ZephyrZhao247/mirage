@@ -265,6 +265,74 @@ enum TaskType {
   TASK_NVSHMEM_TILE_ALLREDUCE = 302,
   TASK_NVSHMEM_GLOBAL_ARGMAX = 303,
   TASK_MULTIGPU_TASK_END = 349, // end placeholder, not a real task
+
+  // -----------------------------------------------------------------------
+  // DeepSeek V4-Flash kernel range (350-400).
+  // One slot per vLLM canonical kernel spec at
+  // docs/mpk/deepseek_v4/vllm_kernels/<kernel>.md.
+  // Pre-allocated up front so parallel per-kernel agents do not race on slot
+  // allocation. Registry: docs/mpk/deepseek_v4/vllm_kernels/_enum_registry.md.
+  // -----------------------------------------------------------------------
+  TASK_V4_TASK_BEGIN = 350, // begin placeholder, not a real task
+
+  // Subsystem: Std layers + sampling (4)
+  TASK_RMS_NORM_V4_SM100                = 350,
+  TASK_APPLY_ROTARY_EMB_V4_SM100        = 351,
+  TASK_VOCAB_PARALLEL_EMBEDDING_V4_SM100 = 352,
+  TASK_LOGITS_PROCESSOR_V4_SM100        = 353,
+
+  // Subsystem: Hyper-Connections (8)
+  TASK_MHC_PRE_BIG_FUSE_V4_SM100             = 354,
+  TASK_MHC_PRE_BIG_FUSE_WITH_NORM_V4_SM100   = 355,
+  TASK_MHC_POST_V4_SM100                     = 356,
+  TASK_HC_HEAD_FUSE_V4_SM100                 = 357,
+  TASK_HC_PRENORM_GEMM_V4_SM100              = 358,
+  TASK_HC_PRENORM_GEMM_BLOCK_M_V4_SM100      = 359,
+  TASK_MHC_FUSED_V4_SM100                    = 360,
+  TASK_TF32_HC_PRENORM_GEMM_V4_SM100         = 361,
+
+  // Subsystem: Attention + cache utilities (10)
+  TASK_FUSED_Q_KV_RMSNORM_V4_SM100                  = 362,
+  TASK_FUSED_DSV4_QNORM_ROPE_KV_INSERT_V4_SM100     = 363,
+  TASK_FLASH_MLA_DECODE_V4_SM100                    = 364,
+  TASK_FLASH_MLA_SPARSE_PREFILL_V4_SM100            = 365,
+  TASK_QUANTIZE_AND_INSERT_K_V4_SM100               = 366,
+  TASK_DEQUANTIZE_AND_GATHER_K_V4_SM100             = 367,
+  TASK_COMPUTE_GLOBAL_TOPK_INDICES_V4_SM100         = 368,
+  TASK_COMBINE_TOPK_SWA_INDICES_V4_SM100            = 369,
+  TASK_FUSED_INV_ROPE_FP8_QUANT_V4_SM100            = 370,
+  TASK_DEEPSEEK_V4_FP8_EINSUM_V4_SM100              = 371,
+
+  // Subsystem: Compressor (2)
+  TASK_SAVE_PARTIAL_STATES_V4_SM100                            = 372,
+  TASK_FUSED_KV_COMPRESS_NORM_ROPE_INSERT_SPARSE_ATTN_V4_SM100 = 373,
+
+  // Subsystem: Indexer (6)
+  TASK_FUSED_KV_COMPRESS_NORM_ROPE_INSERT_INDEXER_ATTN_V4_SM100        = 374,
+  TASK_FUSED_KV_COMPRESS_NORM_ROPE_INSERT_INDEXER_MXFP4_ATTN_V4_SM100  = 375,
+  TASK_FUSED_INDEXER_Q_ROPE_QUANT_V4_SM100                             = 376,
+  TASK_FUSED_INDEXER_Q_ROPE_MXFP4_V4_SM100                             = 377,
+  TASK_FP8_FP4_PAGED_MQA_LOGITS_V4_SM100                               = 378,
+  TASK_FP8_FP4_MQA_LOGITS_V4_SM100                                     = 379,
+
+  // Subsystem: MoE routing + activation (3)
+  TASK_TOPK_SOFTPLUS_SQRT_V4_SM100      = 380,
+  TASK_DSV3_ROUTER_GEMM_V4_SM100        = 381,
+  TASK_SILU_AND_MUL_WITH_CLAMP_V4_SM100 = 382,
+
+  // Subsystem: MoE compute (6)
+  TASK_PREPARE_MEGAMOE_INPUTS_V4_SM100  = 383,
+  TASK_FP8_FP4_MEGA_MOE_V4_SM100        = 384,
+  TASK_FUSED_MOE_KERNEL_V4_SM100        = 385,
+  TASK_FUSED_MOE_KERNEL_GPTQ_AWQ_V4_SM100 = 386,
+  TASK_WRITE_ZEROS_TO_OUTPUT_V4_SM100   = 387,
+  TASK_MOE_ALIGN_BLOCK_SIZE_V4_SM100    = 388,
+
+  // Subsystem: MTP (2)
+  TASK_FUSED_MTP_INPUT_RMSNORM_V4_SM100 = 389,
+  TASK_MTP_SHARED_HEAD_RMSNORM_V4_SM100 = 390,
+
+  TASK_V4_TASK_END = 400, // end placeholder, not a real task
 };
 
 enum EventType {
