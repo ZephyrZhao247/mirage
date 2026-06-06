@@ -52,6 +52,64 @@ from convert import dequantize_fp8, absorb_kv_into_q, get_model_params, is_fp8  
 
 DEFAULT_SAVE_DIR = os.path.join("outputs", "deepseek_v3")
 MAX_SAVE_TOKENS = 100
+FP8_MAX = 448.0
+
+
+# ---------------------------------------------------------------------------
+# FP8 UE8M0 packing helpers (vectorized; match the verified test-mode
+# _pack_group_weight / _qfp8 layouts the MoE / dense-MLP kernels consume).
+# ---------------------------------------------------------------------------
+
+
+def _qfp8_blockscale(w_bf16: torch.Tensor, block: int = 128):
+    """Quantize (N, K) bf16 → FP8 E4M3 (uint8) + 128x128-block f32 scale
+    (N//block, K//block). Vectorized; matches test_dsv3_mlp_fp8 ``_qfp8``."""
+    w = w_bf16.float()
+    N, K = w.shape
+    nb, kb = N // block, K // block
+    blocks = w.reshape(nb, block, kb, block)
+    amax = blocks.abs().amax(dim=(1, 3))               # (nb, kb)
+    scale = torch.where(amax > 0, amax / FP8_MAX,
+                        torch.ones_like(amax))          # (nb, kb)
+    fp8 = (blocks / scale[:, None, :, None]).clamp(-FP8_MAX, FP8_MAX)
+    fp8 = fp8.reshape(N, K).to(torch.float8_e4m3fn).view(torch.uint8)
+    return fp8.contiguous(), scale.contiguous()
+
+
+def _ue8m0_encode(scale: torch.Tensor) -> torch.Tensor:
+    """ceil(log2(scale)) + 127, clamped to [0,255]; matches encode_ue8m0."""
+    enc = torch.ceil(torch.log2(scale.clamp(min=1e-30))).to(torch.int64) + 127
+    return enc.clamp(0, 255)
+
+
+def _pack_group_weight_vec(w_bf16: torch.Tensor, block: int = 128):
+    """Quantize routed-expert weights (E, N, K) bf16 → FP8 (uint8) +
+    K-outer UE8M0-packed scale (num_sf_k, E*N) uint32 — the
+    FP8GroupGEMMSmallM layout (vectorized port of the test's
+    _pack_group_weight)."""
+    w = w_bf16.float()
+    E, N, K = w.shape
+    nb, kb = N // block, K // block
+    num_sf_k = (kb + 3) // 4
+    blocks = w.reshape(E, nb, block, kb, block)
+    amax = blocks.abs().amax(dim=(2, 4))               # (E, nb, kb)
+    s = torch.where(amax > 0, amax / FP8_MAX, torch.ones_like(amax))
+    enc = _ue8m0_encode(s)                              # (E, nb, kb) int64
+    snapped = torch.pow(2.0, (enc - 127).float())      # (E, nb, kb)
+    fp8 = (blocks / snapped[:, :, None, :, None]).clamp(-FP8_MAX, FP8_MAX)
+    fp8 = fp8.reshape(E, N, K).to(torch.float8_e4m3fn).view(torch.uint8)
+
+    # Pack scales K-outer: enc per (e, n, k) at byte (k%4) of packed[k//4, e*N+n].
+    import numpy as np
+    enc_en = enc.repeat_interleave(block, dim=1)       # (E, N, kb)
+    enc_flat = enc_en.reshape(E * N, kb).cpu().numpy().astype(np.uint32)
+    packed_np = np.zeros((num_sf_k, E * N), dtype=np.uint32)
+    for k in range(kb):
+        sk = k // 4
+        shift = (k % 4) * 8
+        packed_np[sk] |= (enc_flat[:, k] & 0xFF) << shift
+    packed = torch.from_numpy(packed_np).to(w.device)
+    return fp8.contiguous(), packed.contiguous()
 
 
 # ---------------------------------------------------------------------------
@@ -278,17 +336,35 @@ def _load_hf_weights_with_absorption(
 
         # ---- MLP: dense vs MoE ----
         if li < first_moe:
-            # Dense MLP: gate / up / down (BF16, no Python-level fusion;
-            # pk.shuffle_tensors fuses gate+up at compile time).
-            for hf_name in [
-                f"{layer_prefix}mlp.gate_proj.weight",
-                f"{layer_prefix}mlp.up_proj.weight",
-                f"{layer_prefix}mlp.down_proj.weight",
-            ]:
-                if hf_name in state_dict:
-                    out[hf_name] = _maybe_dequant(
-                        hf_name, state_dict[hf_name], state_dict
-                    ).to(torch.bfloat16).contiguous()
+            # Dense MLP is FP8 (DeepseekV3MLP.compile uses fp8_gemm_dense_smallm).
+            # The model expects:
+            #   mlp.gate_up_proj.weight       (2I, H) uint8  E4M3, rows[0:I]=gate
+            #   mlp.gate_up_proj.weight_scale_inv (2I/128, H/128) f32  block scale
+            #   mlp.down_proj.weight          (H, I)  uint8  E4M3
+            #   mlp.down_proj.weight_scale_inv    (H/128, I/128) f32
+            # The HF checkpoint already stores these proj weights as FP8 + a
+            # 128x128-block ``weight_scale_inv`` (dequant multiplier), so we
+            # pass the raw FP8 bytes + scales through (NO dequant); the only
+            # transform is concat-fusing gate+up along dim 0 (block-aligned
+            # since I is a multiple of 128).
+            g_w = state_dict.get(f"{layer_prefix}mlp.gate_proj.weight")
+            u_w = state_dict.get(f"{layer_prefix}mlp.up_proj.weight")
+            d_w = state_dict.get(f"{layer_prefix}mlp.down_proj.weight")
+            g_s = state_dict.get(f"{layer_prefix}mlp.gate_proj.weight_scale_inv")
+            u_s = state_dict.get(f"{layer_prefix}mlp.up_proj.weight_scale_inv")
+            d_s = state_dict.get(f"{layer_prefix}mlp.down_proj.weight_scale_inv")
+            if g_w is not None and u_w is not None and d_w is not None:
+                assert is_fp8(g_w) and is_fp8(u_w) and is_fp8(d_w), (
+                    "dense MLP weights expected FP8 in the HF checkpoint")
+                gu = torch.cat([g_w.view(torch.uint8), u_w.view(torch.uint8)],
+                               dim=0).contiguous()
+                gu_s = torch.cat([g_s.float(), u_s.float()], dim=0).contiguous()
+                out[f"{layer_prefix}mlp.gate_up_proj.weight"] = gu
+                out[f"{layer_prefix}mlp.gate_up_proj.weight_scale_inv"] = gu_s
+                out[f"{layer_prefix}mlp.down_proj.weight"] = (
+                    d_w.view(torch.uint8).contiguous())
+                out[f"{layer_prefix}mlp.down_proj.weight_scale_inv"] = (
+                    d_s.float().contiguous())
         else:
             # MoE layer.
             # Router gate.weight + e_score_correction_bias.
@@ -307,18 +383,34 @@ def _load_hf_weights_with_absorption(
                     else:
                         out[hf_name] = raw.to(torch.bfloat16).contiguous()
 
-            # Shared experts.
-            for hf_name in [
-                f"{layer_prefix}mlp.shared_experts.gate_proj.weight",
-                f"{layer_prefix}mlp.shared_experts.up_proj.weight",
-                f"{layer_prefix}mlp.shared_experts.down_proj.weight",
-            ]:
-                if hf_name in state_dict:
-                    out[hf_name] = _maybe_dequant(
-                        hf_name, state_dict[hf_name], state_dict
-                    ).to(torch.bfloat16).contiguous()
+            # Shared experts are a DeepseekV3MLP (FP8 path) — same concat-fused
+            # gate_up + down FP8 layout as the dense MLP above.
+            sg = state_dict.get(
+                f"{layer_prefix}mlp.shared_experts.gate_proj.weight")
+            su = state_dict.get(
+                f"{layer_prefix}mlp.shared_experts.up_proj.weight")
+            sd = state_dict.get(
+                f"{layer_prefix}mlp.shared_experts.down_proj.weight")
+            sg_s = state_dict.get(
+                f"{layer_prefix}mlp.shared_experts.gate_proj.weight_scale_inv")
+            su_s = state_dict.get(
+                f"{layer_prefix}mlp.shared_experts.up_proj.weight_scale_inv")
+            sd_s = state_dict.get(
+                f"{layer_prefix}mlp.shared_experts.down_proj.weight_scale_inv")
+            if sg is not None and su is not None and sd is not None:
+                sp = f"{layer_prefix}mlp.shared_experts."
+                gu = torch.cat([sg.view(torch.uint8), su.view(torch.uint8)],
+                               dim=0).contiguous()
+                gu_s = torch.cat([sg_s.float(), su_s.float()],
+                                 dim=0).contiguous()
+                out[f"{sp}gate_up_proj.weight"] = gu
+                out[f"{sp}gate_up_proj.weight_scale_inv"] = gu_s
+                out[f"{sp}down_proj.weight"] = sd.view(torch.uint8).contiguous()
+                out[f"{sp}down_proj.weight_scale_inv"] = sd_s.float().contiguous()
 
-            # Routed experts: stack into experts.w13 / experts.w2.
+            # Routed experts: dequant HF FP8 -> bf16, stack into (E, N, K), then
+            # re-quantize to the FP8GroupGEMMSmallM UE8M0-packed layout
+            # (experts.w13/.w2 .weight uint8 + .weight_scale uint32).
             inter = config.moe_intermediate_size
             hidden = config.hidden_size
             w13_stack = torch.empty(
@@ -346,12 +438,12 @@ def _load_hf_weights_with_absorption(
                     w13_stack[e, :inter] = g
                     w13_stack[e, inter:] = u
                     w2_stack[e] = d
-            out[f"{layer_prefix}mlp.experts.w13.weight"] = (
-                w13_stack.contiguous()
-            )
-            out[f"{layer_prefix}mlp.experts.w2.weight"] = (
-                w2_stack.contiguous()
-            )
+            w13_fp8, w13_scale = _pack_group_weight_vec(w13_stack.to("cuda"))
+            w2_fp8, w2_scale = _pack_group_weight_vec(w2_stack.to("cuda"))
+            out[f"{layer_prefix}mlp.experts.w13.weight"] = w13_fp8.cpu()
+            out[f"{layer_prefix}mlp.experts.w13.weight_scale"] = w13_scale.cpu()
+            out[f"{layer_prefix}mlp.experts.w2.weight"] = w2_fp8.cpu()
+            out[f"{layer_prefix}mlp.experts.w2.weight_scale"] = w2_scale.cpu()
 
     # Move to CUDA for the load_state_dict step (Parameter device).
     cuda_out = {k: v.to("cuda") for k, v in out.items()}
@@ -501,42 +593,46 @@ def main() -> None:
         kv_cache={"k_cache": ckv_kpe_cache, "v_cache": ckv_kpe_cache},
     )
 
-    # ---- 6. Instantiate model -----------------------------------------
-    with torch.device("cuda"):
-        model = DeepseekV3ForCausalLM(config).to("cuda", dtype=torch.bfloat16)
-
-    if not args.skip_weight_load:
-        print("Loading HF weights with KV absorption + W_UV fusion...")
-        state_dict = _load_hf_weights_with_absorption(
-            args.model_path, config, layer_indices
-        )
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        if missing:
-            print(f"[warn] {len(missing)} missing keys (first 10): "
-                  f"{missing[:10]}")
-        if unexpected:
-            print(f"[warn] {len(unexpected)} unexpected keys (first 10): "
-                  f"{unexpected[:10]}")
-    else:
-        print("[v1] --skip-weight-load set; using random-initialized weights.")
-
-    # ---- 7. Pre-pad lm_head to a 256-multiple vocab -------------------
+    # ---- 6-8. Build + load + compile, all inside the compile scope ----
+    # The model (esp. MoE layers) reads ``current_pk().parallel_config``
+    # during ``__init__``, so construction MUST happen inside the scope.
     raw_vocab = config.vocab_size
     padded_vocab = ((raw_vocab + 255) // 256) * 256
     hidden = config.hidden_size
-    padded_weight = torch.zeros(
-        padded_vocab, hidden, dtype=torch.bfloat16, device="cuda"
-    )
-    padded_weight[:raw_vocab] = model.lm_head.weight.data
-    model.lm_head.weight = torch.nn.Parameter(padded_weight)
-    model.lm_head.out_features = padded_vocab
-    model.argmax_partial.vocab_size = padded_vocab
-    model.argmax_reduce.num_partial_tasks = num_workers
-    model.argmax_partial.num_partial_tasks = num_workers
-
-    # ---- 8. Compile the graph -----------------------------------------
     input_tokens_dt = pk.attach_input(input_tokens, name="input_token")
     with pk.compile_scope():
+        # ---- Instantiate model ----
+        with torch.device("cuda"):
+            model = DeepseekV3ForCausalLM(config).to("cuda", dtype=torch.bfloat16)
+
+        # ---- Load HF weights (absorption + W_UV fusion) ----
+        if not args.skip_weight_load:
+            print("Loading HF weights with KV absorption + W_UV fusion...")
+            state_dict = _load_hf_weights_with_absorption(
+                args.model_path, config, layer_indices
+            )
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            if missing:
+                print(f"[warn] {len(missing)} missing keys (first 10): "
+                      f"{missing[:10]}")
+            if unexpected:
+                print(f"[warn] {len(unexpected)} unexpected keys (first 10): "
+                      f"{unexpected[:10]}")
+        else:
+            print("[v1] --skip-weight-load set; using random-initialized weights.")
+
+        # ---- Pre-pad lm_head to a 256-multiple vocab ----
+        padded_weight = torch.zeros(
+            padded_vocab, hidden, dtype=torch.bfloat16, device="cuda"
+        )
+        padded_weight[:raw_vocab] = model.lm_head.weight.data
+        model.lm_head.weight = torch.nn.Parameter(padded_weight)
+        model.lm_head.out_features = padded_vocab
+        model.argmax_partial.vocab_size = padded_vocab
+        model.argmax_reduce.num_partial_tasks = num_workers
+        model.argmax_partial.num_partial_tasks = num_workers
+
+        # ---- Compile the graph ----
         model.compile(
             input_tokens_dt,
             output_tokens=output_tokens,
