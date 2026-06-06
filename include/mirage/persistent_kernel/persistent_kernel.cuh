@@ -220,9 +220,38 @@ __global__ void prepare_kernel(RuntimeConfig config,
 }
 
 #ifdef MODE_OFFLINE
+#ifdef MPK_TEST_MODE
+// === Test-mode-only scaffolding (single-iteration MLA decode) ===
+// TODO: replace with a general test-mode "run task graph once" mechanism for
+// MODE_OFFLINE; see prepare_next_batch below.
+__device__ int g_mpk_test_decode_done = 0;
+#endif
 // TODO: parallelize this processing
 __device__ __forceinline__ bool
     prepare_next_batch(RuntimeConfig const &config) {
+#ifdef MPK_TEST_MODE
+#if (MPK_MAX_SEQ_LENGTH > 1) && (MPK_MAX_NUM_BATCHED_TOKENS == 1)
+  // === Test-mode-only scaffolding: drive ONE MLA decode iteration ===
+  // Drive exactly ONE MLA decode step against the caller-provided paged KV
+  // cache, bypassing the offline prefill/step-reset batching that would
+  // otherwise re-prefill the prompt. Gated to the MLA-family test config
+  // (max_seq_length>1 AND 1 batched token); MLP/MoE tests (max_seq_length==1)
+  // are unaffected. paged_kv_indices[0] / paged_kv_last_page_len[0] survive
+  // init from the test's meta-tensors (init zeroes only step / qo_indptr /
+  // paged_kv_indptr), giving seq_len = last_page_len = MPK_MAX_SEQ_LENGTH.
+  if (g_mpk_test_decode_done) {
+    return false;  // second call (after the single iteration) -> terminate
+  }
+  g_mpk_test_decode_done = 1;
+  config.request_ids[0] = 0;
+  config.step[0] = MPK_MAX_SEQ_LENGTH - 1;  // rope position of the new token
+  config.qo_indptr_buffer[0] = 0;
+  config.qo_indptr_buffer[1] = 1;           // one new query token
+  config.paged_kv_indptr_buffer[0] = 0;
+  config.paged_kv_indptr_buffer[1] = 1;     // one page
+  return true;                               // run the single decode iteration
+#endif
+#endif
   // Page indices snapshot in global memory (for in-place compaction)
   int page_queue_head = *config.page_queue_head;
   int page_queue_tail = *config.page_queue_tail;
