@@ -6584,8 +6584,11 @@ int TaskRegister::register_mla_kv_gather_sm100_task(
          k_pe_row_stride);
   code.e("  auto *paged_cache_ptr_ = "
          "static_cast<nv_bfloat16*>(task_desc->input_ptrs[2]);");
+  // contiguous_kv is tracked as the single task OUTPUT (graph.cc config (3,1))
+  // so the dependency analyzer adds the producer edge gather -> decode; read it
+  // from output_ptrs[0], not input_ptrs[3].
   code.e("  auto *contiguous_kv_base_ = "
-         "static_cast<nv_bfloat16*>(task_desc->input_ptrs[3]);");
+         "static_cast<nv_bfloat16*>(task_desc->output_ptrs[0]);");
   code.e("  auto *contiguous_kv_ptr_ = "
          "(contiguous_kv_base_ == paged_cache_ptr_) ? contiguous_kv_base_ : "
          "contiguous_kv_base_ + bi_ * S_ * $;",

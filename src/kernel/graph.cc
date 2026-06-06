@@ -958,8 +958,15 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
   else if (name == "mla_kv_gather_sm100") {
     int variant_id = task_register->register_mla_kv_gather_sm100_task(
         customized->bgraph, params);
+    // 3 inputs (c_latent_new, k_pe_new, paged_cache) + 1 output
+    // (contiguous_kv, the materialised decode slab — the LAST bgraph tensor).
+    // Tracking contiguous_kv as an output lets the dependency analyzer add the
+    // producer edge gather -> decode (which reads contiguous_kv); without it
+    // the decode races the gather's step-2 materialisation. paged_cache stays
+    // an in-place input slot (written across iters, serialised by the
+    // end-of-task-graph barrier in the multi-iteration runtime).
     task_config[op] =
-        std::make_tuple(4, 0, TASK_MLA_KV_GATHER_SM100, variant_id);
+        std::make_tuple(3, 1, TASK_MLA_KV_GATHER_SM100, variant_id);
   } else if (name == "mla_kv_gather_split_sm100") {
     int variant_id = task_register->register_mla_kv_gather_split_sm100_task(
         customized->bgraph, params);
