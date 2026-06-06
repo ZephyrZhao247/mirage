@@ -270,16 +270,19 @@ __device__ __forceinline__ void topk_sigmoid_task_impl(
       __syncthreads();
     }
     int const thread_row = row_base + warp_base_row + thread_row_in_warp;
-    // Warp mask: special case is for the THREADS_PER_ROW=16 / 2-rows-per-
-    // warp config where the last (odd) row's upper half-warp needs masking.
-    // Keep using `num_rows` (= compile-time MBT, the stride dim) here, not
-    // `num_active_rows` — with `num_active_rows=1` and full-warp rows
-    // (THREADS_PER_ROW=32 as in DSv3) the `% 2` check would spuriously
-    // produce 0x0000ffff and break __shfl_sync below by leaving lanes
-    // 16..31 outside the mask while they still execute the shuffle.
-    uint32_t const warp_mask = (num_rows % 2 == 1 && thread_row == num_rows - 1)
-                                   ? 0x0000ffff
-                                   : 0xffffffff;
+    // Warp mask: the __shfl_*_sync calls below run ONLY for lanes that enter
+    // the `if (thread_row < num_active_rows)` block, but they name a mask of
+    // lanes that must all reach the shuffle. When a warp covers more rows than
+    // are active (ROWS_PER_WARP > active rows in this warp, e.g. decode/small
+    // MBT with THREADS_PER_ROW=2 ⇒ 16 rows/warp but only 4 active), lanes for
+    // inactive rows skip the `if`, so a 0xffffffff mask deadlocks the shuffle.
+    // Derive the mask via a full-warp ballot of exactly the active-row
+    // predicate. A row's THREADS_PER_ROW lanes share one `thread_row`, so each
+    // shuffle width-subgroup is wholly in or out of the mask — making it valid
+    // for every layout (THREADS_PER_ROW = 2, 16, 32, …). The ballot must be
+    // computed by the FULL warp before the divergent branch.
+    uint32_t const warp_mask =
+        __ballot_sync(0xffffffff, thread_row < num_active_rows);
 
     if (thread_row < num_active_rows) {
 
