@@ -123,6 +123,20 @@ def main():
     ap.add_argument("--max-positions", type=int, default=24,
                     help="Clamp the teacher-forced sequence to this many tokens "
                          "(< page_size=128 so kv fits one tile / num_splits=1).")
+    # Sequential split for memory-bound configs (e.g. 8 layers): at high depth
+    # the MPK(FP8) weights + the HF(bf16) model cannot co-reside on a single
+    # 180GB B200, and the MPK weights are pinned by the compiled C++ task graph
+    # (un-freeable in-process). Run the two phases in SEPARATE processes:
+    #   phase 1 (--mpk-out PATH): build/run MPK, save per-position logits + seq
+    #                             + config to PATH (torch.save), then exit
+    #                             before touching HF.
+    #   phase 2 (--mpk-in PATH):  skip MPK, load the saved logits, build HF, and
+    #                             do the per-position comparison.
+    # Omitting both runs the original single-process flow (fits at <=~4 layers).
+    ap.add_argument("--mpk-out", default=None,
+                    help="Phase 1: save MPK logits to this path and exit.")
+    ap.add_argument("--mpk-in", default=None,
+                    help="Phase 2: load MPK logits from this path; skip MPK.")
     args = ap.parse_args()
 
     torch.set_default_dtype(torch.bfloat16)
@@ -165,7 +179,37 @@ def main():
 
     # =====================================================================
     # MPK side: offline kernel; teacher-force per target position via re-init.
+    # (Skipped in phase 2 / --mpk-in: load the saved logits instead.)
     # =====================================================================
+    if args.mpk_in is not None:
+        blob = torch.load(args.mpk_in)
+        mpk_logits = blob["mpk_logits"]
+        assert blob["seq"] == seq, (
+            "saved MPK seq != current seq; re-run phase 1 with the same "
+            f"--prompt/--layers (saved L={len(blob['seq'])}, now L={L})")
+        print(f"[mpk] loaded logits for {mpk_logits.shape[0]} positions "
+              f"from {args.mpk_in}")
+    else:
+        mpk_logits = _run_mpk(args, cfg, layer_indices, num_layers, seq, L,
+                              HIDDEN, D_K, raw_vocab, padded_vocab, page_size,
+                              compile_max_seq)
+        if args.mpk_out is not None:
+            torch.save({"mpk_logits": mpk_logits, "seq": seq,
+                        "layers": args.layers, "prompt": args.prompt},
+                       args.mpk_out)
+            print(f"[mpk] saved logits for {L} positions to {args.mpk_out}; "
+                  "exiting phase 1 (HF runs in a separate process).")
+            return
+
+    # =====================================================================
+    # HF side: one forward over the full sequence => per-position logits.
+    # =====================================================================
+    _run_hf_and_compare(args, cfg, layer_indices, seq, L, raw_vocab,
+                        mpk_logits, tokenizer)
+
+
+def _run_mpk(args, cfg, layer_indices, num_layers, seq, L, HIDDEN, D_K,
+             raw_vocab, padded_vocab, page_size, compile_max_seq):
     num_workers, num_sched = mi.get_configurations_from_gpu(0)
     # Per-layer combined CKV/KPE paged cache, ONE page (holds 128 positions).
     ckv = torch.zeros(num_layers, 1, page_size, D_K,
@@ -219,6 +263,17 @@ def main():
         missing, unexpected = model.load_state_dict(sd, strict=False)
         print(f"[mpk] load: {len(unexpected)} unexpected keys "
               f"(sample {unexpected[:4]})")
+        # load_state_dict copies sd into the model params (a 2nd ~63GB GPU copy
+        # at 8 layers); free the source dict + the conversion-time cached blocks
+        # so the megakernel's raw cudaMalloc scratch (test.cu) has room. Without
+        # this the 8-layer run OOMs at kernel launch.
+        import gc as _gc
+        del sd
+        _gc.collect()
+        torch.cuda.empty_cache()
+        print(f"[mem] after MPK load: "
+              f"{torch.cuda.memory_allocated() / 1e9:.1f} GB allocated, "
+              f"{torch.cuda.memory_reserved() / 1e9:.1f} GB reserved")
         # Pre-pad lm_head to a 256-multiple vocab (as demo_new.py does).
         padded_w = torch.zeros(padded_vocab, HIDDEN, dtype=torch.bfloat16,
                                device="cuda")
@@ -280,7 +335,11 @@ def main():
     print(f"[mpk] captured logits for {L} positions "
           f"(norm[0]={mpk_logits[0].norm().item():.3f}, "
           f"norm[-1]={mpk_logits[-1].norm().item():.3f})")
+    return mpk_logits
 
+
+def _run_hf_and_compare(args, cfg, layer_indices, seq, L, raw_vocab,
+                        mpk_logits, tokenizer):
     # =====================================================================
     # HF side: one forward over the full sequence => per-position logits.
     # =====================================================================

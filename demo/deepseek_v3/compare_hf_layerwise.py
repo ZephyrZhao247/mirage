@@ -67,6 +67,15 @@ def main():
     ap.add_argument("--mlp-only", action="store_true",
                     help="compare layer-0 dense MLP output (MPK FP8 vs HF) on a "
                          "fixed random input, no residual")
+    # Sequential split for memory-bound depths (e.g. 8 layers): MPK(FP8) weights
+    # are pinned by the compiled C++ task graph and cannot be freed in-process,
+    # so MPK + the HF(bf16) model do not co-reside on a single 180GB B200. Run
+    # the phases in separate processes: phase 1 (--mpk-out PATH) saves the MPK
+    # hidden state and exits; phase 2 (--mpk-in PATH) loads it and runs HF only.
+    ap.add_argument("--mpk-out", default=None,
+                    help="Phase 1: save the MPK hidden state to PATH and exit.")
+    ap.add_argument("--mpk-in", default=None,
+                    help="Phase 2: load the MPK hidden state from PATH; skip MPK.")
     args = ap.parse_args()
 
     torch.set_default_dtype(torch.bfloat16)
@@ -87,6 +96,17 @@ def main():
     tok = args.token_id
 
     # ---------------- MPK side ----------------
+    if args.mpk_in is not None:
+        # Phase 2: load the MPK hidden state saved by phase 1; skip the build.
+        blob = torch.load(args.mpk_in)
+        mpk_h = blob["mpk_h"].to("cuda")
+        if "mlp_in" in blob:
+            globals()["_MLP_IN"] = blob["mlp_in"].to("cuda")
+        print(f"[mpk] loaded hidden (norm={mpk_h.norm().item():.4f}) "
+              f"from {args.mpk_in}")
+        _run_hf_layerwise(args, cfg, layer_indices, pos, tok, mpk_h)
+        return
+
     num_workers, num_sched = mi.get_configurations_from_gpu(0)
     ckv = torch.zeros(num_layers, 1, page_size, D_K, dtype=torch.bfloat16, device="cuda")
 
@@ -132,6 +152,16 @@ def main():
               for k, v in sd.items() if not k.startswith("lm_head")}
         missing, unexpected = model.load_state_dict(sd, strict=False)
         print(f"[mpk] load: {len(unexpected)} unexpected keys (sample {unexpected[:4]})")
+        # Free the source state-dict (load_state_dict already copied it into the
+        # model params) + conversion-time cached blocks, so the megakernel's raw
+        # cudaMalloc scratch has room at 8 layers. (sd is re-referenced below
+        # only in embed/mla/mlp-only paths via globals; the full-stack path here
+        # does not need it.)
+        if not (args.embed_only or args.mla_only or args.mlp_only):
+            import gc as _gc
+            del sd
+            _gc.collect()
+            torch.cuda.empty_cache()
         if args.embed_only:
             # Compile ONLY the embedding (token -> hidden); no decoder layers.
             model.embed_tokens.compile(
@@ -182,6 +212,23 @@ def main():
     pk.finalize()
     print(f"[mpk] hidden norm={mpk_h.norm().item():.4f}  [:6]={mpk_h[:6]}")
 
+    if args.mpk_out is not None:
+        # Phase 1: persist the MPK hidden (and the mlp-only random input, if any)
+        # and exit BEFORE building HF. The MPK FP8 weights are pinned by the
+        # compiled C++ task graph (un-freeable in-process), so at 8 layers the HF
+        # bf16 model must load in a separate process.
+        blob = {"mpk_h": mpk_h.cpu(), "layers": args.layers}
+        if "_MLP_IN" in globals():
+            blob["mlp_in"] = globals()["_MLP_IN"].cpu()
+        torch.save(blob, args.mpk_out)
+        print(f"[mpk] saved hidden to {args.mpk_out}; exiting phase 1 "
+              "(HF runs in a separate process).")
+        return
+
+    _run_hf_layerwise(args, cfg, layer_indices, pos, tok, mpk_h)
+
+
+def _run_hf_layerwise(args, cfg, layer_indices, pos, tok, mpk_h):
     # ---------------- HF side ----------------
     sd_full = D._selectively_load_layers(args.model_path, layer_indices)
     # dequant HF weights to bf16 for an eager HF model (use the maintained impl).
