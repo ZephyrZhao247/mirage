@@ -58,6 +58,8 @@ from ...layers import (
     MPKModule,
     MLADecode,
     MLAKVGather,
+    MLAMtpDecode,
+    MLAMtpReduce,
     MLAReduce,
     MLARopeK,
     MLARopeQ,
@@ -196,40 +198,56 @@ class DeepseekV3MLA(MPKModule):
         self.v_head_dim = self.kv_lora_rank
 
         # ---- Layernorm scales ----------------------------------------
-        self.q_a_layernorm = nn.Parameter(torch.empty(self.q_lora_rank))
-        self.kv_a_layernorm = nn.Parameter(torch.empty(self.kv_lora_rank))
+        # NB: declare bf16 explicitly — the MLA kernels (rmsnorm/linear/rope)
+        # read these as bf16. A default-fp32 nn.Parameter that's copy_()'d from
+        # bf16 weights would be read 4-bytes-as-two-bf16 (garbled) unless the
+        # caller also does .to(bfloat16); declaring the dtype makes the module
+        # correct on its own.
+        self.q_a_layernorm = nn.Parameter(
+            torch.empty(self.q_lora_rank, dtype=torch.bfloat16))
+        self.kv_a_layernorm = nn.Parameter(
+            torch.empty(self.kv_lora_rank, dtype=torch.bfloat16))
 
         # ---- Linear weights (raw nn.Parameter; the v1 path does NOT
         #     fuse qkv_a at compile time — keeping the wiring minimal).
         # q_a_proj: (q_lora_rank, hidden)
         self.q_a_proj_weight = nn.Parameter(
-            torch.empty(self.q_lora_rank, self.hidden_size)
+            torch.empty(self.q_lora_rank, self.hidden_size,
+                        dtype=torch.bfloat16)
         )
         # kv_a_proj_with_mqa: (kv_lora_rank + qk_rope_head_dim, hidden)
         self.kv_a_proj_with_mqa_weight = nn.Parameter(
             torch.empty(
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 self.hidden_size,
+                dtype=torch.bfloat16,
             )
         )
         # q_b_proj (KV-absorbed): (H * (kv_lora_rank + qk_rope_head_dim),
         # q_lora_rank) — driver applies absorption before load_state_dict.
         self.q_b_proj_weight = nn.Parameter(
-            torch.empty(self.num_heads * self.qk_head_dim, self.q_lora_rank)
+            torch.empty(self.num_heads * self.qk_head_dim, self.q_lora_rank,
+                        dtype=torch.bfloat16)
         )
         # o_proj (W_UV-fused): (hidden, H * kv_lora_rank). HF native is
         # (hidden, H * v_head_dim); the driver fuses W_UV in at load time.
         self.o_proj_weight = nn.Parameter(
-            torch.empty(self.hidden_size, self.num_heads * self.kv_lora_rank)
+            torch.empty(self.hidden_size, self.num_heads * self.kv_lora_rank,
+                        dtype=torch.bfloat16)
         )
 
         # ---- Catalog leaves (no parameters in catalog; just dispatch) ----
         self.rope_q = MLARopeQ(num_heads=self.num_heads, variant="fused")
         self.rope_k = MLARopeK()
+        # The gather kernel templates PAGE_SIZE and indexes the paged cache
+        # by it, so it MUST equal the runtime pk.page_size (the pool is
+        # allocated at that page size). config has no page_size attribute, so
+        # the old getattr default of 128 silently diverged from a smaller
+        # --page-size, OOB-ing the paged-cache append/gather.
         self.kv_gather = MLAKVGather(
             d_k=self.qk_head_dim,
             d_v=self.kv_lora_rank,
-            page_size=getattr(config, "page_size", 128),
+            page_size=current_pk().page_size,
             variant="standard",
         )
         # decode/reduce concrete params are filled in by compile() (they
@@ -278,7 +296,8 @@ class DeepseekV3MLA(MPKModule):
         )
 
     # ------------------------------------------------------------------
-    def compile(self, x_dt, cos_dt, sin_dt, *, residual_dt, output):
+    def compile(self, x_dt, cos_dt, sin_dt, *, residual_dt, output,
+                probe_q=None, probe_kv=None):
         """Build the MLA task graph for one decoder layer.
 
         Args:
@@ -287,6 +306,11 @@ class DeepseekV3MLA(MPKModule):
             residual_dt: residual DTensor for the o_proj+residual epilogue.
             output: destination DTensor for ``attn_proj_out`` (the output
                 of o_proj+residual). Shape ``(mbt, hidden)``.
+            probe_q / probe_kv: optional debug-only output DTensors. When
+                given, identity-copy the post-RoPE fused Q (``per_layer_q_nope_pe``,
+                shape ``(mbt, H*D_K)``) and the gathered KV slab
+                (``per_layer_contiguous_kv``, shape ``(mbr*kv_len_max, D_K)``)
+                into them so a test can diff them against an oracle.
         """
         pk = current_pk()
         from ....core import bfloat16 as _mi_bf16, float32 as _mi_f32
@@ -405,7 +429,13 @@ class DeepseekV3MLA(MPKModule):
         )
 
         # ---- 4. kv_a_proj_with_mqa : Linear --------------------------
-        kv_a_grid = _grid_for_linear(self.kv_lora_rank + self.qk_rope_head_dim)
+        # N = kv_lora_rank + qk_rope_head_dim = 576. _grid_for_linear(576)
+        # returns 96 (576 % 96 == 0) -> 6-element (12-byte) per-task output
+        # slices, whose TMA base pointers are not 16B-aligned, so the output
+        # TMA descriptor is rejected ("invalid argument"), the linear store
+        # never completes, its event never fires, and the whole layer chain
+        # deadlocks. Use a grid with 64-element (16B-aligned) slices, like o_proj.
+        kv_a_grid = (self.kv_lora_rank + self.qk_rope_head_dim) // 64
         pk.linear_layer(
             input=x_dt,
             weight=w_kv_a_dt,
@@ -417,6 +447,8 @@ class DeepseekV3MLA(MPKModule):
         # ---- 5. kv_a_layernorm : RMSNorm over the c_latent slice -----
         # The kv_a_out row layout is [c_latent (kv_lora_rank) | k_pe (D_PE)].
         # rmsnorm operates on the [0:kv_lora_rank) slice in place.
+        # `pk.rmsnorm_layer` normalises the first `process_dim` columns of the
+        # buffer (offset 0), leaving the [kv_lora_rank:] k_pe tail untouched.
         pk.rmsnorm_layer(
             input=per_layer_kv_a_out,
             weight=w_kv_a_ln_dt,
@@ -424,8 +456,6 @@ class DeepseekV3MLA(MPKModule):
             grid_dim=(mbt, 1, 1),
             block_dim=(128, 1, 1),
             process_dim=self.kv_lora_rank,
-            in_offset_elems=0,
-            out_offset_elems=0,
         )
 
         # ---- 6a. RoPE on Q (fused per-head [NoPE | PE]) -------------
@@ -439,77 +469,81 @@ class DeepseekV3MLA(MPKModule):
             sin_pos_embed=sin_dt,
         )
 
-        # ---- 6b. RoPE on K (in-place on the k_pe slice of kv_a_out) -
+        # c_latent / k_pe are mpk.narrow VIEWS into the combined
+        # [c_latent(kv_lora_rank) | k_pe(qk_rope_head_dim)] kv_a_out row. The
+        # view encodes the column start (the runtime pre-offsets each task's
+        # base pointer); only the parent row stride is passed. The K-rope /
+        # gather codegen has NO offset-param concept (sizes 1/2 and 3/5) —
+        # offsets MUST come via the views.
+        kv_row_stride = self.kv_lora_rank + self.qk_rope_head_dim  # 576
+        c_latent_view = pk.narrow(
+            per_layer_kv_a_out, dim=1, start=0, length=self.kv_lora_rank)
+        k_pe_view = pk.narrow(
+            per_layer_kv_a_out, dim=1, start=self.kv_lora_rank,
+            length=self.qk_rope_head_dim)
+
+        # ---- 6b. RoPE on K (in-place on the k_pe view) -------------
         self.rope_k.compile(
-            k_pe=per_layer_kv_a_out,
+            k_pe=k_pe_view,
             cos_pos_embed=cos_dt,
             sin_pos_embed=sin_dt,
-            # The k_pe slice lives at [kv_lora_rank : kv_lora_rank + D_PE)
-            # within each row of the (kv_lora_rank + D_PE)-wide kv_a_out.
-            k_pe_row_stride=self.kv_lora_rank + self.qk_rope_head_dim,
-            k_pe_offset=self.kv_lora_rank,
+            k_pe_row_stride=kv_row_stride,
         )
 
         # ---- 7. MLA KV gather (standard variant) --------------------
-        # Attaches the per-layer paged KV cache pool, appends the new
-        # c_latent / k_pe rows from kv_a_out (the row stride / offset
-        # kwargs let the gather kernel read the c_latent slice from the
-        # combined kv_a_out buffer), and materialises a contiguous KV
-        # slab for the decode kernel.
+        # Appends the new c_latent / k_pe rows (narrow views) to the per-layer
+        # paged KV cache and materialises a contiguous KV slab for decode.
         k_cache_torch, _ = pk.get_kv_cache(self.layer_idx)
         layer_cache_dt = pk.attach_input(
             k_cache_torch, name=f"{self.prefix}ckv_kpe_cache"
         )
-        # c_latent_new and k_pe_new are both views into per_layer_kv_a_out.
-        # We pass kv_a_out as BOTH inputs; the kernel uses the (row_stride,
-        # offset) kwargs to address the c_latent slice [0:kv_lora_rank)
-        # and the k_pe slice [kv_lora_rank:kv_lora_rank+D_PE) inside it.
         self.kv_gather.compile(
-            c_latent_new=per_layer_kv_a_out,
-            k_pe_new=per_layer_kv_a_out,
+            c_latent_new=c_latent_view,
+            k_pe_new=k_pe_view,
             paged_cache=layer_cache_dt,
             contiguous_kv=per_layer_contig_kv,
-            c_latent_row_stride=self.kv_lora_rank + self.qk_rope_head_dim,
-            c_latent_offset_elems=0,
-            k_pe_row_stride=self.kv_lora_rank + self.qk_rope_head_dim,
-            k_pe_offset_elems=self.kv_lora_rank,
+            c_latent_row_stride=kv_row_stride,
+            k_pe_row_stride=kv_row_stride,
         )
 
-        # ---- 8. MLA decode + reduce ---------------------------------
-        # Instantiate the catalog modules lazily (kv_len / num_splits
-        # depend on pk fields that aren't known at __init__ time).
-        if self._decode is None:
-            self._decode = MLADecode(
-                num_heads=H,
-                d_k=D_K,
-                d_v=D_V,
-                num_splits=num_splits,
-                kv_len=kv_len_max,
-                q_len=1,
-                prefix=self.prefix,
+        # ---- 8. MLA decode (+ reduce when split-K) ------------------
+        # New-API leaves wrapping the demo-proven kernels (mla_mtp_decode_sm100 /
+        # mla_mtp_reduce_sm100 — what builder.py uses for q_len=1 decode). NOT
+        # the buggy "mla_decode_sm100" (catalog MLADecode, disabled) and NOT the
+        # forbidden legacy pk.*_layer methods.
+        #
+        # IMPORTANT (matches builder.py:2707-2913): when num_splits == 1 (a
+        # single 128-token KV tile) the decode codegen instantiates
+        # WRITE_FINAL=true — it normalises and writes the FINAL head-major attn
+        # output directly to its `output_partial` slot, and does NOT write the
+        # partial LSE. In that single-split regime the reduce MUST be SKIPPED
+        # (running it would reinterpret the head-major final output as a
+        # col-major partial and merge it with a garbage LSE). So: point the
+        # decode's output at `per_layer_attn_out` and skip the reduce. For
+        # num_splits >= 2 the decode emits partial-O + LSE and the reduce merges
+        # them (write_final=false) — the classic split-K path.
+        self._decode = MLAMtpDecode(q_len=1, kv_len=kv_len_max)
+        if num_splits == 1:
+            self._reduce = None
+            self._decode.compile(
+                q_input=per_layer_q_nope_pe,
+                kv_input=per_layer_contig_kv,
+                output_partial=per_layer_attn_out,
+                output_lse=per_layer_partial_lse,
             )
-        if self._reduce is None:
-            self._reduce = MLAReduce(
-                num_heads=H,
-                d_v=D_V,
-                num_splits=num_splits,
-                d_start=0,
-                d_count=2,
-                q_len=1,
-                prefix=self.prefix,
+        else:
+            self._reduce = MLAMtpReduce(q_len=1, kv_len=kv_len_max)
+            self._decode.compile(
+                q_input=per_layer_q_nope_pe,
+                kv_input=per_layer_contig_kv,
+                output_partial=per_layer_partial_o,
+                output_lse=per_layer_partial_lse,
             )
-
-        self._decode.compile(
-            q_input=per_layer_q_nope_pe,
-            kv_input=per_layer_contig_kv,
-            output_partial=per_layer_partial_o,
-            output_lse=per_layer_partial_lse,
-        )
-        self._reduce.compile(
-            input_partial=per_layer_partial_o,
-            input_lse=per_layer_partial_lse,
-            output=per_layer_attn_out,
-        )
+            self._reduce.compile(
+                input_partial=per_layer_partial_o,
+                input_lse=per_layer_partial_lse,
+                output=per_layer_attn_out,
+            )
 
         # ---- 9. o_proj + residual -----------------------------------
         # Output shape: (mbt, hidden_size). The fused W_UV * W_o weight
@@ -522,6 +556,26 @@ class DeepseekV3MLA(MPKModule):
             grid_dim=(self.hidden_size // 64, 1, 1),
             block_dim=(128, 1, 1),
         )
+
+        # ---- Debug probes (identity copies of the two decode inputs) -----
+        # NOTE: a probe identity adds a SECOND consumer of the probed buffer
+        # (the first being the decode). The fused rope_q output / gathered KV
+        # then become fork-producers, which can trip the case-3 fork/join
+        # validator. Enable at most one probe at a time for bisection.
+        if probe_kv is not None:
+            pk.identity_layer(
+                input=per_layer_contig_kv,
+                output=probe_kv,
+                grid_dim=(mbr * kv_len_max, 1, 1),
+                block_dim=(128, 1, 1),
+            )
+        if probe_q is not None:
+            pk.identity_layer(
+                input=per_layer_q_nope_pe,
+                output=probe_q,
+                grid_dim=(mbt, 1, 1),
+                block_dim=(128, 1, 1),
+            )
         return output
 
 
@@ -720,7 +774,11 @@ class DeepseekV3MoE(MPKModule):
         self._m_total = self.local_num_experts * self.bm_padding
 
         # Router (bf16) + group-limited sigmoid routing (owns e_score bias).
-        self.gate_weight = nn.Parameter(torch.empty(E, H))
+        # bf16 (not default fp32): pk.linear_layer registers the bf16
+        # linear_sm100 GEMM, which reads the weight bytes as bf16. An fp32
+        # param copy_'d from bf16 logits would be read 4-bytes-as-two-bf16
+        # (garbage) -> wrong router logits -> wrong expert routing.
+        self.gate_weight = nn.Parameter(torch.empty(E, H, dtype=torch.bfloat16))
         self.routing = MoETopkRouting(
             num_experts=E, num_experts_per_tok=self.num_experts_per_tok,
             variant="sigmoid", num_groups=self.num_groups,
@@ -781,8 +839,15 @@ class DeepseekV3MoE(MPKModule):
         nk = K // block
         num_sf_k = (nk + 3) // 4
         w = gg.weight.view(torch.float8_e4m3fn).float()
-        sfb = gg.weight_scale.view(num_sf_k, E, N).permute(1, 2, 0).contiguous()
-        sfb_bytes = sfb.view(torch.uint8).reshape(E, N, num_sf_k * 4)[..., :nk]
+        # weight_scale is (num_sf_k, E*N) uint32; each word packs 4 K-block
+        # UE8M0 bytes (little-endian). Reinterpret bytes on the contiguous
+        # last-dim-stride-1 layout, then gather K-block kk from word kk//4,
+        # byte kk%4. NB: the old `.permute(...).contiguous().view(uint8)`
+        # breaks when num_sf_k==1 — a size-1 trailing dim leaves a non-unit
+        # stride that .contiguous() does not fix (real DSv3 K=7168 hides this).
+        ws_bytes = gg.weight_scale.view(torch.uint8).reshape(num_sf_k, E, N, 4)
+        kk = torch.arange(nk, device=w.device)
+        sfb_bytes = ws_bytes[kk // 4, :, :, kk % 4].permute(1, 2, 0)  # (E, N, nk)
         sfb_f32 = torch.pow(torch.tensor(2.0, device=w.device),
                             sfb_bytes.float() - 127.0)
         sfb_exp = sfb_f32.repeat_interleave(block, dim=-1)[..., :K]
@@ -1108,17 +1173,43 @@ class DeepseekV3ForCausalLM(MPKModule):
         pk = current_pk()
         h_dt = self.model.compile(input_tokens_dt)
 
+        # The lm_head GEMM output tile (= padded_vocab // grid.x) must be a
+        # multiple of 8 elements (16B for bf16) or the per-task TMA output
+        # descriptor lands on a non-16B-aligned base and creation fails ->
+        # launch failure. Mirror the working builder's grid choice: for the
+        # large 256-aligned vocab, 256-wide tiles (grid = vocab // 256).
+        padded_vocab = self.lm_head.out_features
+        if padded_vocab % 256 == 0:
+            lm_head_grid = padded_vocab // 256
+        elif padded_vocab % 96 == 0:
+            lm_head_grid = padded_vocab // 96
+        elif padded_vocab % 64 == 0:
+            lm_head_grid = padded_vocab // 64
+        else:
+            raise ValueError(
+                f"lm_head padded_vocab={padded_vocab} not divisible by "
+                "256/96/64; cannot pick a 16B-aligned GEMM grid."
+            )
+
         logits_dt = self.lm_head.compile(
             h_dt,
-            grid_dim=(pk.num_workers, 1, 1),
+            grid_dim=(lm_head_grid, 1, 1),
             block_dim=(128, 1, 1),
         )
 
-        self.argmax_partial.num_partial_tasks = pk.num_workers
-        self.argmax_reduce.num_partial_tasks = pk.num_workers
+        # Argmax fan-out must EXACTLY divide padded_vocab (ArgmaxPartial
+        # CHUNK_SIZE = V / num_partial_tasks) and stay <= num_workers. Pick
+        # the largest such divisor.
+        num_partial = 1
+        for k in range(min(pk.num_workers, padded_vocab), 0, -1):
+            if padded_vocab % k == 0:
+                num_partial = k
+                break
+        self.argmax_partial.num_partial_tasks = num_partial
+        self.argmax_reduce.num_partial_tasks = num_partial
         part_val_dt, part_idx_dt = self.argmax_partial.compile(
             logits_dt,
-            grid_dim=(pk.num_workers, 1, 1),
+            grid_dim=(num_partial, 1, 1),
             block_dim=(128, 1, 1),
         )
         return self.argmax_reduce.compile(
