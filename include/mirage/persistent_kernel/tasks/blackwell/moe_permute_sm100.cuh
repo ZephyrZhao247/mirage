@@ -61,7 +61,12 @@ namespace kernel {
 //
 // Buffer layout (compile-time M_TOTAL = E_LOCAL * BM_PADDING):
 //   input_fp8           : (MBT, K)         uint8
-//   input_scale         : (MBT, K_PACKED)  uint32           — UE8M0 packed
+//   input_scale         : (K_PACKED, MBT_ALIGNED) uint32    — UE8M0 packed,
+//                         COLUMN-MAJOR as written by quantize_fp8_sm100
+//                         (out[sf * MBT_ALIGNED + t], MBT_ALIGNED =
+//                          round_up(MBT, 4)). The MPK builder declares this
+//                         buffer with shape (MBT, K_PACKED) but the kernel
+//                         indexes it column-major to match the producer.
 //   topk_weights        : (MBT, TOPK)      float32
 //   routing_indices     : (E_LOCAL, MBT)   int32            — topk_sigmoid
 //   output permuted_fp8 (out)  : (M_TOTAL, K)     uint8 permuted_scale (out):
@@ -132,6 +137,16 @@ __device__ __forceinline__ void
   constexpr int CP_BYTES = 16;
   constexpr int NUM_VEC = K / CP_BYTES;
   static_assert(K % CP_BYTES == 0, "K must be 16-byte aligned");
+
+  // The input scale (`input_scale_ptr`) is produced by quantize_fp8_sm100,
+  // which writes the UE8M0 packed scale in COLUMN-MAJOR layout
+  // [K_PACKED, MBT_ALIGNED]: out[sf * MBT_ALIGNED + t], where MBT_ALIGNED =
+  // round_up(MBT, 4) (see task_register.cc `aligned_batch`). Reading it as
+  // row-major (`in_scale[t * K_PACKED + sf]`) is only correct when
+  // K_PACKED == 1 (the layouts coincide); for K_PACKED >= 2 (hidden >= 1024)
+  // the per-token scale columns get scrambled. Use the matching column-major
+  // stride here.
+  constexpr int MBT_ALIGNED = ((MBT + 3) / 4) * 4;
 
   // This CTA owns experts [e_lo, e_hi). E_PER_CTA == 1 (the default)
   // reproduces the legacy 1-CTA-per-expert path with e == cta_idx.
@@ -204,10 +219,12 @@ __device__ __forceinline__ void
         dst_v[i] = src_v[i];
       }
 
-      // Transpose-pack the scale row.
-      uint32_t const *src_scale = in_scale + (size_t)t * K_PACKED;
+      // Transpose-pack the scale row. Input scale is column-major
+      // [K_PACKED, MBT_ALIGNED] (out[sf * MBT_ALIGNED + t]); output is
+      // column-major [K_PACKED, M_TOTAL].
       for (int sf = tid; sf < K_PACKED; sf += nthreads) {
-        out_scale[(size_t)sf * M_TOTAL + row] = src_scale[sf];
+        out_scale[(size_t)sf * M_TOTAL + row] =
+            in_scale[(size_t)sf * MBT_ALIGNED + t];
       }
 
       if (tid == 0) {

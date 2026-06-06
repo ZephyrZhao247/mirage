@@ -90,7 +90,10 @@ class MoEPermute(MPKModule):
 
         Tensor contract:
           input_fp8: (MBT, K) fp8_e4m3 (uint8 in kernel) — pre-quantized activations.
-          input_scale: (MBT, K_PACKED) uint32 — UE8M0 packed (4 group-scales per uint32, REQUIRED).
+          input_scale: (MBT, K_PACKED) uint32 buffer — UE8M0 packed (4 group-scales
+            per uint32, REQUIRED). NOTE: physically COLUMN-MAJOR as produced by
+            quantize_fp8_sm100 (out[sf * round_up(MBT,4) + t]); the kernel reads it
+            column-major. The (MBT, K_PACKED) shape is the allocation, not the layout.
           topk_weights: (MBT, TOPK) fp32 — routing scores to be permuted into ``meta``.
           routing_indices: (E_LOCAL, MBT) int32, EXPERT-MAJOR (slot+1 or 0).
           permuted_fp8 (out): (M_TOTAL=E_LOCAL*bm_padding, K) fp8 (uint8), per-expert padded.
