@@ -29,9 +29,11 @@ def test_dsv3_moe():
     device = "cuda"
     torch.manual_seed(0)
     mbt = 4
-    H = 256
-    I = 256                # moe_intermediate_size
-    E = 8                  # n_routed_experts
+    # H/I overridable via env to exercise the production hidden size (7168),
+    # which triggers K_PACKED>=4 in the permute input-scale read path.
+    H = int(os.environ.get("MOE_H", "256"))
+    I = int(os.environ.get("MOE_I", "256"))  # moe_intermediate_size
+    E = 16                 # n_routed_experts (EXPERTS_PER_GROUP = E/n_group must be a multiple of VPT=8)
     cfg = SimpleNamespace(
         hidden_size=H, moe_intermediate_size=I, n_routed_experts=E,
         num_experts_per_tok=2, n_shared_experts=1, n_group=2, topk_group=1,
