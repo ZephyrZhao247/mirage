@@ -1058,17 +1058,27 @@ class DeepseekV3Model(MPKModule):
             prefix=f"{prefix}embed_tokens_",
         )
         # RoPE on the qk_rope_head_dim (=64) channels — NOT head_dim.
-        # We use the plain RotaryEmbedding from the catalog; if the model
-        # config has rope_scaling/yarn, the proper YARN-aligned cos/sin
-        # would go through builder._precompute_rope_embeddings. v1 falls
-        # back to plain RoPE so the modeling can stand alone for the
-        # smoke-test, with a recorded TODO to plumb YARN later.
+        # The MLA RoPE kernel (deepseek_mla_rope_*_sm100) rotates GPT-J
+        # interleaved pairs (x[2i], x[2i+1]), so cos/sin must use the
+        # repeat_interleave(2) layout (interleaved=True). When the config
+        # carries rope_scaling/yarn (DeepSeek-V3: factor=40, original_max=4096),
+        # YARN scaling + mscale are baked into the tables, matching HF
+        # _compute_yarn_parameters + apply_rotary_pos_emb_interleave. This
+        # replicates the proven legacy builder._precompute_rope_embeddings.
+        rope_scaling = getattr(config, "rope_scaling", None)
+        # rope_theta lives at config top level for some checkpoints and nested
+        # in rope_scaling for others (HF standardize_rope_params injects it).
+        rope_theta = getattr(config, "rope_theta", None)
+        if rope_theta is None and rope_scaling is not None:
+            rope_theta = rope_scaling.get("rope_theta")
+        rope_theta = float(rope_theta) if rope_theta is not None else 10000.0
         rope_max = min(4096, getattr(config, "max_position_embeddings", 4096))
-        rope_theta = getattr(config, "rope_theta", 10000.0)
         self.rotary_emb = RotaryEmbedding(
             head_dim=config.qk_rope_head_dim,
             max_position_embeddings=rope_max,
             base=rope_theta,
+            rope_scaling=rope_scaling,
+            interleaved=True,
             prefix=f"{prefix}rotary_emb_",
         )
         self.layers = nn.ModuleList([
