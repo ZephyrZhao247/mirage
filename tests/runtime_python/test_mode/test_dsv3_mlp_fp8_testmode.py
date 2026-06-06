@@ -50,16 +50,41 @@ def test_dsv3_mlp_fp8():
     I = 1024         # interm  (1024/128=8, 8%4==0 → UE8M0 ok)
 
     cfg = SimpleNamespace(hidden_size=H, intermediate_size=I)
-    m = DeepseekV3MLP(cfg, prefix="mlp_").to(device)
+    # IMPORTANT (2026-06-06 regression guard): cast the module to bf16 — the
+    # HF-faithful driver does ``DeepseekV3Model(cfg).to(dtype=torch.bfloat16)``,
+    # which would silently downcast the fp32 128x128-block weight_scale params
+    # to bf16. The fp8_gemm_dense_smallm kernel reads weight_scale as float*, so
+    # a bf16 scale buffer makes each 4-byte read span TWO bf16 scale entries →
+    # ~100x-1000x garbage (pre-fix: cosine ~0.03, output norm ~2600x too large).
+    # DeepseekV3MLP._apply must restore fp32. This test FAILS pre-fix.
+    m = DeepseekV3MLP(cfg, prefix="mlp_").to(device).to(dtype=torch.bfloat16)
+    assert m.gate_up_scale.dtype == torch.float32, (
+        f"weight_scale must stay fp32 after .to(bfloat16); got "
+        f"{m.gate_up_scale.dtype}")
 
-    # Random reference weights, quantized into the module's FP8 params.
-    gate = torch.randn(I, H, dtype=torch.bfloat16, device=device) * 0.05
-    up = torch.randn(I, H, dtype=torch.bfloat16, device=device) * 0.05
-    down = torch.randn(H, I, dtype=torch.bfloat16, device=device) * 0.05
+    # Weights with REALISTIC ~100x per-128x128-block scale VARIATION (like real
+    # DeepSeek weight_scale_inv, 9e-6..1e-3). Uniform-scale weights (the old
+    # randn*0.05) hid the bf16-scale bug because all blocks shared one scale.
+    def _blockscaled(N, K, seed):
+        g = torch.Generator(device=device).manual_seed(seed)
+        nb, kb = N // 128, K // 128
+        # per-(128x128)-block magnitude spanning ~100x: 2^(-17 + (bi+ki)%8).
+        bi = torch.arange(nb, device=device)[:, None]
+        ki = torch.arange(kb, device=device)[None, :]
+        blk_mag = torch.pow(2.0, (-17 + (bi + ki) % 8).float())  # (nb,kb)
+        w = (torch.randn(nb, 128, kb, 128, generator=g, device=device)
+             * blk_mag[:, None, :, None] * 100.0).reshape(N, K).to(torch.bfloat16)
+        return w
+
+    gate = _blockscaled(I, H, 1)
+    up = _blockscaled(I, H, 2)
+    down = _blockscaled(H, I, 3)
     gate_up = torch.cat([gate, up], dim=0)  # (2I, H), rows [0:I]=gate, [I:2I]=up
 
     gu_fp8, gu_scale = _qfp8(gate_up)
     dn_fp8, dn_scale = _qfp8(down)
+    print(f"weight_scale variation: gate_up {gu_scale.min():.2e}..{gu_scale.max():.2e} "
+          f"(~{gu_scale.max()/gu_scale.min():.0f}x), down {dn_scale.min():.2e}..{dn_scale.max():.2e}")
     with torch.no_grad():
         m.gate_up_weight.copy_(gu_fp8)
         m.gate_up_scale.copy_(gu_scale)
@@ -100,10 +125,16 @@ def test_dsv3_mlp_fp8():
 
     max_abs = (out.float() - ref.float()).abs().max().item()
     max_rel = max_abs / max(ref.float().abs().max().item(), 1e-6)
+    cos = torch.nn.functional.cosine_similarity(
+        out.float().flatten(), ref.float().flatten(), dim=0).item()
+    norm_ratio = out.float().norm().item() / max(ref.float().norm().item(), 1e-9)
     print(f"out[0,:6]: {out[0,:6]}")
     print(f"ref[0,:6]: {ref[0,:6]}")
-    print(f"max abs {max_abs:.5f} rel {max_rel:.5f}")
-    ok = max_rel < 0.10
+    print(f"max abs {max_abs:.5f} rel {max_rel:.5f} cosine {cos:.6f} "
+          f"norm_ratio {norm_ratio:.3f}")
+    # cosine guard catches the bf16-scale bug (pre-fix cosine ~0.03, norm ~2600x);
+    # rel guard catches fine-grained drift.
+    ok = max_rel < 0.10 and cos > 0.999 and 0.9 < norm_ratio < 1.1
     print("PASSED" if ok else "FAILED")
     pk.finalize()
     if not ok:

@@ -658,6 +658,29 @@ class DeepseekV3MLP(MPKModule):
             unexpected_keys, error_msgs
         )
 
+    def _apply(self, fn, *args, **kwargs):
+        """Keep the 128x128-block weight scales in fp32 across a blanket
+        ``model.to(dtype=torch.bfloat16)``.
+
+        ``fp8_gemm_dense_smallm`` reads ``weight_scale`` as ``float*`` (the
+        kernel's ``sb`` operand). The HF-faithful driver casts the whole model
+        to bf16 (``DeepseekV3Model(cfg).to(dtype=torch.bfloat16)``); the default
+        ``nn.Module._apply`` would silently downcast these fp32 scale params to
+        bf16, after which each 4-byte ``float`` the GEMM reads spans TWO bf16
+        scale entries — producing ~100x-1000x-magnitude garbage (output norm
+        blew up ~2600x vs HF; cosine ~0.03). The MoE experts are immune because
+        their scale is uint32 (UE8M0-packed). Restore fp32 here so the GEMM's
+        per-128x128-block dequant sees the real scales. Mirrors the MLA
+        layernorm params' explicit-dtype guard above (same bf16-reinterpret
+        hazard class)."""
+        super()._apply(fn, *args, **kwargs)
+        with torch.no_grad():
+            if self.gate_up_scale.dtype != torch.float32:
+                self.gate_up_scale.data = self.gate_up_scale.data.float()
+            if self.down_scale.dtype != torch.float32:
+                self.down_scale.data = self.down_scale.data.float()
+        return self
+
     def forward(self, x, residual):
         """HF reference, dequantizing the stored FP8 weights (fp32 math)."""
         I = self.intermediate_size
