@@ -169,7 +169,12 @@ class _FP8GroupGEMMBase(MPKModule):
         N = b_dt.dim(1)
         assert b_dt.dim(2) == K
         assert m_indices.dim(0) == M_total
-        params = [M_total, N, K, E, num_workers]
+        # 6th param = active_mask_offset; -1 => no active-expert mask (nullptr).
+        # The C++ codegen (register_fp8_group_gemm_variant) reads params[5]; a
+        # 5-element list reads OOB (assert compiled out in the release build),
+        # emits the active-mask path, and dereferences an uninitialized
+        # input_ptrs[5] -> illegal memory access. The legacy caller passes -1.
+        params = [M_total, N, K, E, num_workers, -1]
         grid_dim_local = (num_workers, 1, 1)
         block_dim_local = (256, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim_local, block_dim_local, 1, 64))

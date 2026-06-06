@@ -98,7 +98,9 @@ from .mla import (
     MLAPrefillTP8Chunked,
     MLAPrefillTP8ChunkedSplitK,
     MLAPrefillTP8ChunkedReduce,
+    MLAMtpDecode,
     MLAMtpDecodeTP,
+    MLAMtpReduce,
     MLAMtpReduceTP,
 )
 
@@ -209,7 +211,9 @@ __all__ = [
     "MLAPrefillTP8Chunked",
     "MLAPrefillTP8ChunkedSplitK",
     "MLAPrefillTP8ChunkedReduce",
+    "MLAMtpDecode",
     "MLAMtpDecodeTP",
+    "MLAMtpReduce",
     "MLAMtpReduceTP",
     # MoE
     "MoETopkSoftmaxRouting",

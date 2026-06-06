@@ -38,7 +38,12 @@ from .prefill import (
     MLAPrefillTP8ChunkedSplitK,
     MLAPrefillTP8ChunkedReduce,
 )
-from .mtp_decode import MLAMtpDecodeTP, MLAMtpReduceTP
+from .mtp_decode import (
+    MLAMtpDecode,
+    MLAMtpDecodeTP,
+    MLAMtpReduce,
+    MLAMtpReduceTP,
+)
 
 __all__ = [
     # MLA KV gather (3 variants + legacy factory)
@@ -62,6 +67,8 @@ __all__ = [
     "MLAPrefillTP8Chunked",
     "MLAPrefillTP8ChunkedSplitK",
     "MLAPrefillTP8ChunkedReduce",
+    "MLAMtpDecode",
     "MLAMtpDecodeTP",
+    "MLAMtpReduce",
     "MLAMtpReduceTP",
 ]

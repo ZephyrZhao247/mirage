@@ -109,19 +109,20 @@ class MLAKVGatherStandard(_MLAKVGatherBase):
         from ....kernel import TBGraph
 
         d_k, d_v, page_size = self.d_k, self.d_v, self.page_size
-        slice_override = (
-            c_latent_row_stride is not None
-            or c_latent_offset_elems != 0
-            or k_pe_row_stride is not None
-            or k_pe_offset_elems != 0
-        )
-        if slice_override:
+        # Codegen (register_mla_kv_gather_sm100_task) accepts size 3 or 5:
+        #   size 5 = [d_k, d_v, page_size, c_latent_row_stride, k_pe_row_stride]
+        # Column offsets come from mpk.narrow views on c_latent_new / k_pe_new
+        # (the runtime pre-offsets each task's base pointer) — there is NO
+        # offset param. Pass offsets via views, not *_offset_elems.
+        assert c_latent_offset_elems == 0 and k_pe_offset_elems == 0, (
+            "MLAKVGatherStandard: pass column offsets via mpk.narrow views on "
+            "c_latent_new / k_pe_new, not c_latent_offset_elems / "
+            "k_pe_offset_elems (the kernel has no offset param)")
+        if c_latent_row_stride is not None or k_pe_row_stride is not None:
             params = [
                 d_k, d_v, page_size,
                 c_latent_row_stride if c_latent_row_stride is not None else d_v,
-                c_latent_offset_elems,
                 k_pe_row_stride if k_pe_row_stride is not None else 128,
-                k_pe_offset_elems,
             ]
         else:
             params = [d_k, d_v, page_size]

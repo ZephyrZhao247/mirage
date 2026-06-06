@@ -321,10 +321,16 @@ class MLARopeK(MPKModule):
         from ....core import CyTBGraph
         from ....kernel import TBGraph
 
+        # Codegen (register_deepseek_mla_rope_k_sm100_task) accepts size 1 or 2
+        # = [q_tile_size] / [q_tile_size, k_pe_row_stride]. The column offset
+        # comes from an mpk.narrow view on k_pe (runtime pre-offsets the base
+        # pointer) — there is NO k_pe_offset param.
+        assert k_pe_offset == 0, (
+            "MLARopeK: pass the k_pe column offset via an mpk.narrow view on "
+            "k_pe, not k_pe_offset (the kernel has no offset param)")
         params = [self.q_tile_size]
-        if k_pe_row_stride is not None or k_pe_offset != 0:
-            row_stride = k_pe_row_stride if k_pe_row_stride is not None else 128
-            params = [self.q_tile_size, row_stride, k_pe_offset]
+        if k_pe_row_stride is not None:
+            params = [self.q_tile_size, k_pe_row_stride]
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(k_pe, (-1, -1, -1), -1, True)
         tb_graph.new_input(cos_pos_embed, (-1, -1, -1), -1, True)

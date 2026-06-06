@@ -148,6 +148,160 @@ def _mla_mtp_reduce_tp_register(
     pk.kn_graph.register_task(tb_graph, task_name, params)
 
 
+def _mla_mtp_grouping(q_len: int) -> Tuple[int, int]:
+    """(hpb, num_head_groups) for single-GPU MLA-MTP decode/reduce over 128
+    heads: hpb = largest divisor of 128 that is <= 128 // q_len."""
+    hpb = 128 // q_len
+    while hpb > 0 and 128 % hpb != 0:
+        hpb -= 1
+    if hpb <= 0:
+        hpb = 1
+    return hpb, 128 // hpb
+
+
+class MLAMtpDecode(MPKModule):
+    """Single-GPU MLA split-K decode (partial-O + partial-LSE).
+
+    Task ``mla_mtp_decode_sm100`` — the WORKING decode the legacy demo
+    (``builder.py``) uses for q_len-batched decode (q_len 1..8); 128 Q heads
+    are packed ``hpb = 128 // q_len`` per block-group. Prefer this over the
+    buggy catalog ``MLADecode`` (``mla_decode_sm100``). Pair with
+    :class:`MLAMtpReduce`. Args: ``q_len``, ``kv_len``, ``num_heads`` (128),
+    ``d_k`` (576), ``d_v`` (512), ``prefix``.
+    """
+
+    def __init__(self, *, q_len: int, kv_len: int, num_heads: int = 128,
+                 d_k: int = 576, d_v: int = 512, prefix: str = "") -> None:
+        super().__init__(prefix=prefix)
+        self.q_len = q_len
+        self.kv_len = kv_len
+        self.num_heads = num_heads
+        self.d_k = d_k
+        self.d_v = d_v
+
+    @property
+    def num_splits(self) -> int:
+        return (self.kv_len + 127) // 128  # TILE_S = 128
+
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError(
+            "MLAMtpDecode.forward(): runtime-meta driven (paged KV / qo "
+            "indptr / split-K); use the test-mode PK driver."
+        )
+
+    def auto_grid_dim(self, *_: DTensor) -> GridDim:
+        """``(num_splits, num_head_groups, max_num_batched_requests)`` —
+        request_id rides grid.z; grid.y is the head-group axis."""
+        pk = current_pk()
+        _, nhg = _mla_mtp_grouping(self.q_len)
+        return (self.num_splits, nhg, pk.max_num_batched_requests)
+
+    def default_block_dim(self) -> BlockDim:
+        return (128, 1, 1)
+
+    def compile(self, q_input: DTensor, kv_input: DTensor,
+                output_partial: DTensor, output_lse: DTensor, *,
+                grid_dim: Optional[GridDim] = None,
+                block_dim: Optional[BlockDim] = None,
+                ) -> Tuple[DTensor, DTensor]:
+        """Register ``mla_mtp_decode_sm100`` (split-K partial attention).
+
+        Tensor contract:
+          q_input:        (R*Q_LEN*NUM_HEADS=128, D_K=576) bf16, row-major.
+          kv_input:       (R*KV_LEN, D_K=576) bf16, contiguous gathered slab.
+          output_partial: (R*Q_LEN*num_head_groups*num_splits, D_V*128) bf16.
+          output_lse:     (R*Q_LEN*num_head_groups*num_splits, 128) fp32.
+        Notes: params [num_head_groups, q_len, kv_len, num_splits]; kv_len read
+        at runtime from paged_kv_* meta-tensors. Same kernel/params as the
+        legacy pk.mla_mtp_decode_layer (the demo's decode path).
+        """
+        pk = current_pk()
+        if grid_dim is None:
+            grid_dim = self.auto_grid_dim()
+        if block_dim is None:
+            block_dim = self.default_block_dim()
+        from ....core import CyTBGraph
+        from ....kernel import TBGraph
+        _, nhg = _mla_mtp_grouping(self.q_len)
+        params = [nhg, self.q_len, self.kv_len, self.num_splits]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(q_input, (-1, -1, -1), -1, True)
+        tb_graph.new_input(kv_input, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output_partial, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output_lse, (-1, -1, -1), -1, True)
+        pk.kn_graph.customized(
+            [q_input, kv_input, output_partial, output_lse], tb_graph
+        )
+        pk.kn_graph.register_task(tb_graph, "mla_mtp_decode_sm100", params)
+        return output_partial, output_lse
+
+
+class MLAMtpReduce(MPKModule):
+    """Single-GPU MLA split-K reduce (LSE-weighted merge across splits).
+
+    Task ``mla_mtp_reduce_sm100`` — pairs with :class:`MLAMtpDecode`. Each
+    block reduces ``rd_dv`` (=2) V-columns for one head-group / request;
+    output ``(B, Q_LEN, NUM_HEADS, D_V)`` ready for o_proj. Args: ``q_len``,
+    ``kv_len``, ``d_v`` (512), ``prefix``.
+    """
+
+    def __init__(self, *, q_len: int, kv_len: int, d_v: int = 512,
+                 prefix: str = "") -> None:
+        super().__init__(prefix=prefix)
+        self.q_len = q_len
+        self.kv_len = kv_len
+        self.d_v = d_v
+        self.rd_dv = 2
+
+    @property
+    def num_splits(self) -> int:
+        return (self.kv_len + 127) // 128
+
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError(
+            "MLAMtpReduce.forward(): runtime-meta driven; use test-mode PK driver."
+        )
+
+    def auto_grid_dim(self, *_: DTensor) -> GridDim:
+        """``(ceil(D_V/rd_dv), num_head_groups, max_num_batched_requests)``."""
+        pk = current_pk()
+        _, nhg = _mla_mtp_grouping(self.q_len)
+        return ((self.d_v + self.rd_dv - 1) // self.rd_dv, nhg,
+                pk.max_num_batched_requests)
+
+    def default_block_dim(self) -> BlockDim:
+        return (256, 1, 1)
+
+    def compile(self, input_partial: DTensor, input_lse: DTensor,
+                output: DTensor, *, grid_dim: Optional[GridDim] = None,
+                block_dim: Optional[BlockDim] = None) -> DTensor:
+        """Register ``mla_mtp_reduce_sm100``.
+
+        Tensor contract:
+          input_partial: (R*Q_LEN*num_head_groups*num_splits, D_V*128) bf16.
+          input_lse:     (R*Q_LEN*num_head_groups*num_splits, 128) fp32.
+          output:        (B, Q_LEN, NUM_HEADS=128, D_V=512) bf16 (-> o_proj).
+        Notes: params [num_head_groups, q_len, num_splits, rd_dv=2]. Same
+        kernel/params as the legacy pk.mla_mtp_reduce_layer.
+        """
+        pk = current_pk()
+        if grid_dim is None:
+            grid_dim = self.auto_grid_dim()
+        if block_dim is None:
+            block_dim = self.default_block_dim()
+        from ....core import CyTBGraph
+        from ....kernel import TBGraph
+        _, nhg = _mla_mtp_grouping(self.q_len)
+        params = [nhg, self.q_len, self.num_splits, self.rd_dv]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input_partial, (-1, -1, -1), -1, True)
+        tb_graph.new_input(input_lse, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output, (-1, -1, -1), -1, True)
+        pk.kn_graph.customized([input_partial, input_lse, output], tb_graph)
+        pk.kn_graph.register_task(tb_graph, "mla_mtp_reduce_sm100", params)
+        return output
+
+
 class MLAMtpDecodeTP(MPKModule):
     """MLA-MTP decode dispatcher over TP world sizes 1/2/4/8.
 
