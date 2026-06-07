@@ -2241,6 +2241,47 @@ int TaskRegister::register_elementwise_add_sm100_task(
   return register_task_variant(TASK_ELEMENTWISE_ADD_SM100, code.to_string());
 }
 
+// V4-Flash naive apply_rotary_emb (GPT-J / interleaved RoPE). Spec:
+// docs/mpk/deepseek_v4/vllm_kernels/apply_rotary_emb.md.
+// Params: [HEAD_DIM, ROTARY_DIM] (both ints, ROTARY_DIM<=HEAD_DIM, even).
+// Inputs: x [num_rows, head_dim], cos [num_rows, rotary_dim/2],
+//         sin [num_rows, rotary_dim/2]  (all bf16, contiguous; per-row
+//         pre-gathered by the catalog so the kernel needs no
+//         seqlen_offsets).
+// Output: out [num_rows, head_dim] bf16, contiguous.
+int TaskRegister::register_apply_rotary_emb_v4_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 2);
+  int head_dim = params[0];
+  int rotary_dim = params[1];
+
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 3;  // x, cos, sin
+  int num_outputs = 1; // out
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::apply_rotary_emb_v4_sm100_task_impl<cute::bfloat16_t, $, $>(",
+         head_dim,
+         rotary_dim);
+  code.e("    task_desc->input_ptrs[0],");
+  code.e("    task_desc->input_ptrs[1],");
+  code.e("    task_desc->input_ptrs[2],");
+  code.e("    task_desc->output_ptrs[0]);");
+  return register_task_variant(TASK_APPLY_ROTARY_EMB_V4_SM100,
+                               code.to_string());
+}
+
 int TaskRegister::register_softmax_gather_sm100_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
   assert(params.size() == 0);
@@ -7406,6 +7447,79 @@ int TaskRegister::register_mla_mtp_decode_tp8_reduce_sm100_task(
   code.e("      bi_);");
   code.e("}");
   return register_task_variant(TASK_MLA_MTP_DECODE_TP8_REDUCE_SM100,
+                               code.to_string());
+}
+
+// ============================================================================
+// V4-Flash MTP: fused_mtp_input_rmsnorm (naive SM100 integration)
+// ============================================================================
+// Spec: docs/mpk/deepseek_v4/vllm_kernels/fused_mtp_input_rmsnorm.md
+// Decision: NEW kernel (cannot reuse existing rmsnorm_hopper -- dual stream
+// outputs, pos==0 mask on enorm, prev_hidden indexed by [token, slot, hidden]).
+//
+// TBGraph operator order (matches the Python catalog
+// fused_mtp_input_rmsnorm.py):
+//   inputs:
+//     [0] inputs_embeds   bf16  [num_tokens, HIDDEN]
+//     [1] positions       int64 [num_tokens]
+//     [2] prev_hidden     bf16  [num_tokens, HC_MULT, HIDDEN]
+//     [3] enorm_weight    bf16  [HIDDEN]
+//     [4] hnorm_weight    bf16  [HIDDEN]
+//   outputs:
+//     [0] enorm_out       bf16  [num_tokens, HIDDEN]
+//     [1] hnorm_out       bf16  [num_tokens, HC_MULT, HIDDEN]
+//
+// params: []. HIDDEN and HC_MULT are derived from the bgraph tensor shapes.
+int TaskRegister::register_fused_mtp_input_rmsnorm_v4_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 0);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int const num_inputs = 5;
+  int const num_outputs = 2;
+  assert(bgraph.operators.size() == (size_t)(num_inputs + num_outputs));
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+
+  // HIDDEN comes from enorm_out's last dim (= inputs_embeds last dim).
+  assert(output_ops[0]->dtensor.num_dims == 2);
+  int const hidden_dim = output_ops[0]->dtensor.dim[1];
+
+  // HC_MULT comes from hnorm_out's middle dim (= prev_hidden middle dim).
+  assert(output_ops[1]->dtensor.num_dims == 3);
+  int const hc_mult = output_ops[1]->dtensor.dim[1];
+  assert(output_ops[1]->dtensor.dim[2] == hidden_dim);
+
+  // Sanity: prev_hidden shape matches.
+  assert(input_ops[2]->dtensor.num_dims == 3);
+  assert(input_ops[2]->dtensor.dim[1] == hc_mult);
+  assert(input_ops[2]->dtensor.dim[2] == hidden_dim);
+  // Sanity: positions is 1-D int64.
+  assert(input_ops[1]->dtensor.num_dims == 1);
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  // NUM_THREADS = 256 == Blackwell WORKER_NUM_THREADS. block_dim is
+  // chosen by the Python catalog; we hard-code the template arg to
+  // match. eps = 1e-6f matches V4-Flash's config.rms_norm_eps.
+  code.e("kernel::fused_mtp_input_rmsnorm_v4_sm100_impl<$, $, 256>(",
+         hidden_dim,
+         hc_mult);
+  code.e("    task_desc->input_ptrs[0],");  // inputs_embeds
+  code.e("    task_desc->input_ptrs[1],");  // positions
+  code.e("    task_desc->input_ptrs[2],");  // prev_hidden
+  code.e("    task_desc->input_ptrs[3],");  // enorm_weight
+  code.e("    task_desc->input_ptrs[4],");  // hnorm_weight
+  code.e("    task_desc->output_ptrs[0],"); // enorm_out
+  code.e("    task_desc->output_ptrs[1],"); // hnorm_out
+  code.e("    1e-6f);");
+  return register_task_variant(TASK_FUSED_MTP_INPUT_RMSNORM_V4_SM100,
                                code.to_string());
 }
 

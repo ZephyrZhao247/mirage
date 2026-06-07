@@ -25,6 +25,7 @@
 #if defined(USE_NVSHMEM) && defined(MIRAGE_GRACE_BLACKWELL)
 #include "tasks/blackwell/allreduce.cuh"
 #endif
+#include "apply_rotary_emb_v4_sm100.cuh"
 #include "argmax_sm100.cuh"
 #if defined(USE_NVSHMEM) && defined(MIRAGE_GRACE_BLACKWELL)
 #include "nvshmem_argmax_sm100.cuh"
@@ -39,6 +40,7 @@
 #include "fp8_group_gemm_largem_sm100.cuh"
 #include "fp8_group_gemm_sm100.cuh"
 #include "fp8_group_gemm_smallm_sm100.cuh"
+#include "fused_mtp_input_rmsnorm_v4_sm100.cuh"
 #include "fused_rmsnorm_quantize_fp8_sm100.cuh"
 #include "linear_fp8_bmm_dense_sm100.cuh"
 #include "linear_fp8_bmm_sm100.cuh"

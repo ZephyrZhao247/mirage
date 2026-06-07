@@ -666,6 +666,13 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(2, 1, TASK_ELEMENTWISE_ADD_SM100, variant_id);
+  } else if (name == "apply_rotary_emb_v4_sm100") {
+    // V4-Flash naive RoPE (GPT-J interleaved). Spec:
+    // docs/mpk/deepseek_v4/vllm_kernels/apply_rotary_emb.md.
+    int variant_id = task_register->register_apply_rotary_emb_v4_sm100_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(3, 1, TASK_APPLY_ROTARY_EMB_V4_SM100, variant_id);
   } else if (name == "softmax_gather_sm100") {
     int variant_id = task_register->register_softmax_gather_sm100_task(
         customized->bgraph, params);
@@ -1024,6 +1031,16 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(1, 1, TASK_MTP_BUILD_EMBED_INPUT, variant_id);
+  } else if (name == "fused_mtp_input_rmsnorm_v4_sm100") {
+    // V4-Flash MTP input dual-RMSNorm (naive Blackwell). See
+    // docs/mpk/deepseek_v4/vllm_kernels/fused_mtp_input_rmsnorm.md.
+    // Inputs: inputs_embeds, positions(int64), prev_hidden, enorm_w, hnorm_w
+    // Outputs: enorm_out, hnorm_out
+    int variant_id =
+        task_register->register_fused_mtp_input_rmsnorm_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        5, 2, TASK_FUSED_MTP_INPUT_RMSNORM_V4_SM100, variant_id);
   }
   // Multi-GPU tasks
   else if (name == "nvshmem_allgather_strided_put") {

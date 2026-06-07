@@ -107,6 +107,10 @@ public:
                                 std::vector<int> const &params);
   int register_elementwise_add_sm100_task(threadblock::Graph const &bgraph,
                                           std::vector<int> const &params);
+  // V4-Flash std-layer kernels (naive). Spec:
+  // docs/mpk/deepseek_v4/vllm_kernels/apply_rotary_emb.md.
+  int register_apply_rotary_emb_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
   int register_softmax_gather_sm100_task(threadblock::Graph const &bgraph,
                                          std::vector<int> const &params);
   int register_mtp_verify_probabilistic_task(threadblock::Graph const &bgraph,
@@ -238,6 +242,10 @@ public:
                                        std::vector<int> const &params);
   int register_mtp_build_embed_input_task(threadblock::Graph const &bgraph,
                                           std::vector<int> const &params);
+  // V4-Flash MTP tasks (SM100, naive integration).
+  // Spec: docs/mpk/deepseek_v4/vllm_kernels/fused_mtp_input_rmsnorm.md
+  int register_fused_mtp_input_rmsnorm_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
   // SM100 tasks end
   // Multi-GPU tasks
   int register_nvshmem_allgather_strided_put_task(
