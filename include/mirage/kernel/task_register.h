@@ -246,6 +246,32 @@ public:
   // Spec: docs/mpk/deepseek_v4/vllm_kernels/fused_mtp_input_rmsnorm.md
   int register_fused_mtp_input_rmsnorm_v4_sm100_task(
       threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // V4-Flash HC tasks (SM100, naive integration). Specs:
+  //   docs/mpk/deepseek_v4/vllm_kernels/mhc_post_tilelang.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/mhc_pre_big_fuse_tilelang.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/mhc_pre_big_fuse_with_norm_tilelang.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/mhc_fused_tilelang.md
+  int register_mhc_post_v4_sm100_task(threadblock::Graph const &bgraph,
+                                      std::vector<int> const &params);
+  int register_mhc_pre_big_fuse_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_mhc_pre_big_fuse_with_norm_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_mhc_fused_v4_sm100_task(threadblock::Graph const &bgraph,
+                                       std::vector<int> const &params);
+  // V4-Flash HC GEMM + head kernels (SM100, naive integration). Specs:
+  //   docs/mpk/deepseek_v4/vllm_kernels/hc_prenorm_gemm_tilelang.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/hc_prenorm_gemm_block_m_tilelang.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/hc_head_fuse_tilelang.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/tf32_hc_prenorm_gemm.md
+  int register_hc_prenorm_gemm_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_hc_prenorm_gemm_block_m_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_hc_head_fuse_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_tf32_hc_prenorm_gemm_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
   // SM100 tasks end
   // Multi-GPU tasks
   int register_nvshmem_allgather_strided_put_task(

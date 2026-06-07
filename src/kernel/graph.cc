@@ -1041,6 +1041,80 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
             customized->bgraph, params);
     task_config[op] = std::make_tuple(
         5, 2, TASK_FUSED_MTP_INPUT_RMSNORM_V4_SM100, variant_id);
+  } else if (name == "mhc_post_v4_sm100") {
+    // V4-Flash HC mhc_post (naive Blackwell). See
+    // docs/mpk/deepseek_v4/vllm_kernels/mhc_post_tilelang.md.
+    // Inputs: comb_mix, residual_in, post_mix, x_in.
+    // Output: residual_out.
+    int variant_id = task_register->register_mhc_post_v4_sm100_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(4, 1, TASK_MHC_POST_V4_SM100, variant_id);
+  } else if (name == "mhc_pre_big_fuse_v4_sm100") {
+    // V4-Flash HC mhc_pre_big_fuse (naive Blackwell, no fused norm). See
+    // docs/mpk/deepseek_v4/vllm_kernels/mhc_pre_big_fuse_tilelang.md.
+    // Inputs: gemm_out_mul, gemm_out_sqrsum, hc_scale, hc_base, residual.
+    // Outputs: post_mix, comb_mix, layer_input.
+    int variant_id = task_register->register_mhc_pre_big_fuse_v4_sm100_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(5, 3, TASK_MHC_PRE_BIG_FUSE_V4_SM100, variant_id);
+  } else if (name == "mhc_pre_big_fuse_with_norm_v4_sm100") {
+    // V4-Flash HC mhc_pre_big_fuse_with_norm (naive Blackwell). See
+    // docs/mpk/deepseek_v4/vllm_kernels/mhc_pre_big_fuse_with_norm_tilelang.md.
+    // Inputs: gemm_out_mul, gemm_out_sqrsum, hc_scale, hc_base, residual,
+    //         norm_weight.
+    // Outputs: post_mix, comb_mix, layer_input.
+    int variant_id =
+        task_register->register_mhc_pre_big_fuse_with_norm_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        6, 3, TASK_MHC_PRE_BIG_FUSE_WITH_NORM_V4_SM100, variant_id);
+  } else if (name == "mhc_fused_v4_sm100") {
+    // V4-Flash HC mhc_fused (naive Blackwell, decode regime). See
+    // docs/mpk/deepseek_v4/vllm_kernels/mhc_fused_tilelang.md.
+    // Inputs: comb_mix, residual_in, post_mix, x_in, weight_t.
+    // Outputs: gemm_out_mul, gemm_out_sqrsum, residual_out.
+    int variant_id = task_register->register_mhc_fused_v4_sm100_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(5, 3, TASK_MHC_FUSED_V4_SM100, variant_id);
+  } else if (name == "hc_prenorm_gemm_v4_sm100") {
+    // V4-Flash HC hc_prenorm_gemm (naive Blackwell). See
+    // docs/mpk/deepseek_v4/vllm_kernels/hc_prenorm_gemm_tilelang.md.
+    // Inputs: x (bf16), fn (fp32). Outputs: gemm_out (fp32), sqrsum (fp32).
+    int variant_id = task_register->register_hc_prenorm_gemm_v4_sm100_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(2, 2, TASK_HC_PRENORM_GEMM_V4_SM100, variant_id);
+  } else if (name == "hc_prenorm_gemm_block_m_v4_sm100") {
+    // V4-Flash HC hc_prenorm_gemm_block_m (naive Blackwell). Same outputs
+    // as the non-block_m variant; aliased to the same naive impl. See
+    // docs/mpk/deepseek_v4/vllm_kernels/hc_prenorm_gemm_block_m_tilelang.md.
+    int variant_id =
+        task_register->register_hc_prenorm_gemm_block_m_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        2, 2, TASK_HC_PRENORM_GEMM_BLOCK_M_V4_SM100, variant_id);
+  } else if (name == "tf32_hc_prenorm_gemm_v4_sm100") {
+    // V4-Flash HC tf32_hc_prenorm_gemm (naive Blackwell, sm_100a only).
+    // Same outputs as hc_prenorm_gemm; aliased to the same naive impl. See
+    // docs/mpk/deepseek_v4/vllm_kernels/tf32_hc_prenorm_gemm.md.
+    int variant_id =
+        task_register->register_tf32_hc_prenorm_gemm_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        2, 2, TASK_TF32_HC_PRENORM_GEMM_V4_SM100, variant_id);
+  } else if (name == "hc_head_fuse_v4_sm100") {
+    // V4-Flash HC hc_head_fuse (naive Blackwell). Terminal HC kernel
+    // collapsing [T, HC_MULT, H] -> [T, H]. See
+    // docs/mpk/deepseek_v4/vllm_kernels/hc_head_fuse_tilelang.md.
+    // Inputs: residual (bf16), fn (fp32), hc_scale (fp32 [1]),
+    //         hc_base (fp32 [HC_MULT]). Output: out (bf16).
+    int variant_id = task_register->register_hc_head_fuse_v4_sm100_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(4, 1, TASK_HC_HEAD_FUSE_V4_SM100, variant_id);
   }
   // Multi-GPU tasks
   else if (name == "nvshmem_allgather_strided_put") {

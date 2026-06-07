@@ -1967,6 +1967,22 @@ TaskGraphResult print_task_graph(
   task_type_to_name[TASK_MTP_BUILD_EMBED_INPUT] = "TASK_MTP_BUILD_EMBED_INPUT";
   task_type_to_name[TASK_FUSED_MTP_INPUT_RMSNORM_V4_SM100] =
       "TASK_FUSED_MTP_INPUT_RMSNORM_V4_SM100";
+  // V4-Flash HC kernels (naive Blackwell). Specs under
+  // docs/mpk/deepseek_v4/vllm_kernels/.
+  task_type_to_name[TASK_MHC_PRE_BIG_FUSE_V4_SM100] =
+      "TASK_MHC_PRE_BIG_FUSE_V4_SM100";
+  task_type_to_name[TASK_MHC_PRE_BIG_FUSE_WITH_NORM_V4_SM100] =
+      "TASK_MHC_PRE_BIG_FUSE_WITH_NORM_V4_SM100";
+  task_type_to_name[TASK_MHC_POST_V4_SM100] = "TASK_MHC_POST_V4_SM100";
+  task_type_to_name[TASK_MHC_FUSED_V4_SM100] = "TASK_MHC_FUSED_V4_SM100";
+  task_type_to_name[TASK_HC_PRENORM_GEMM_V4_SM100] =
+      "TASK_HC_PRENORM_GEMM_V4_SM100";
+  task_type_to_name[TASK_HC_PRENORM_GEMM_BLOCK_M_V4_SM100] =
+      "TASK_HC_PRENORM_GEMM_BLOCK_M_V4_SM100";
+  task_type_to_name[TASK_HC_HEAD_FUSE_V4_SM100] =
+      "TASK_HC_HEAD_FUSE_V4_SM100";
+  task_type_to_name[TASK_TF32_HC_PRENORM_GEMM_V4_SM100] =
+      "TASK_TF32_HC_PRENORM_GEMM_V4_SM100";
   task_type_to_name[TASK_QUANTIZE_FP8_SM100] = "TASK_QUANTIZE_FP8_SM100";
   task_type_to_name[TASK_LINEAR_FP8_SM100] = "TASK_LINEAR_FP8_SM100";
   task_type_to_name[TASK_LINEAR_FP8_WITH_RESIDUAL_SM100] =

@@ -7523,5 +7523,455 @@ int TaskRegister::register_fused_mtp_input_rmsnorm_v4_sm100_task(
                                code.to_string());
 }
 
+// ============================================================================
+// V4-Flash HC: mhc_post (naive SM100 integration)
+// ============================================================================
+// Spec: docs/mpk/deepseek_v4/vllm_kernels/mhc_post_tilelang.md
+//
+// TBGraph operator order (matches the Python catalog mhc_post.py):
+//   inputs:
+//     [0] comb_mix       fp32 [num_tokens, HC, HC]
+//     [1] residual_in    bf16 [num_tokens, HC, HIDDEN]
+//     [2] post_mix       fp32 [num_tokens, HC]
+//     [3] x_in           bf16 [num_tokens, HIDDEN]
+//   outputs:
+//     [0] residual_out   bf16 [num_tokens, HC, HIDDEN]
+//
+// params: []. HC and HIDDEN are derived from residual_out.
+int TaskRegister::register_mhc_post_v4_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 0);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int const num_inputs = 4;
+  int const num_outputs = 1;
+  assert(bgraph.operators.size() == (size_t)(num_inputs + num_outputs));
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+
+  // residual_out: [num_tokens, HC, HIDDEN].
+  assert(output_ops[0]->dtensor.num_dims == 3);
+  int const hc = output_ops[0]->dtensor.dim[1];
+  int const hidden = output_ops[0]->dtensor.dim[2];
+
+  // Sanity-check the other shapes.
+  assert(input_ops[0]->dtensor.num_dims == 3);
+  assert(input_ops[0]->dtensor.dim[1] == hc);
+  assert(input_ops[0]->dtensor.dim[2] == hc);
+  assert(input_ops[1]->dtensor.num_dims == 3);
+  assert(input_ops[1]->dtensor.dim[1] == hc);
+  assert(input_ops[1]->dtensor.dim[2] == hidden);
+  assert(input_ops[2]->dtensor.num_dims == 2);
+  assert(input_ops[2]->dtensor.dim[1] == hc);
+  assert(input_ops[3]->dtensor.num_dims == 2);
+  assert(input_ops[3]->dtensor.dim[1] == hidden);
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::mhc_post_v4_sm100_impl<$, $, 256>(", hc, hidden);
+  code.e("    task_desc->input_ptrs[0],");   // comb_mix
+  code.e("    task_desc->input_ptrs[1],");   // residual_in
+  code.e("    task_desc->input_ptrs[2],");   // post_mix
+  code.e("    task_desc->input_ptrs[3],");   // x_in
+  code.e("    task_desc->output_ptrs[0]);"); // residual_out
+  return register_task_variant(TASK_MHC_POST_V4_SM100, code.to_string());
+}
+
+// ============================================================================
+// V4-Flash HC: mhc_pre_big_fuse (naive SM100 integration, no fused norm)
+// ============================================================================
+// Spec: docs/mpk/deepseek_v4/vllm_kernels/mhc_pre_big_fuse_tilelang.md
+//
+// TBGraph operator order (matches the Python catalog mhc_pre_big_fuse.py):
+//   inputs:
+//     [0] gemm_out_mul    fp32 [N_SPLITS, num_tokens, HC_MULT3]
+//     [1] gemm_out_sqrsum fp32 [N_SPLITS, num_tokens]
+//     [2] hc_scale        fp32 [3]
+//     [3] hc_base         fp32 [HC_MULT3]
+//     [4] residual        bf16 [num_tokens, HC_MULT, HIDDEN]
+//   outputs:
+//     [0] post_mix        fp32 [num_tokens, HC_MULT]
+//     [1] comb_mix        fp32 [num_tokens, HC_MULT*HC_MULT]
+//     [2] layer_input     bf16 [num_tokens, HIDDEN]
+//
+// params: []. HIDDEN/HC_MULT/N_SPLITS are derived from input shapes.
+int TaskRegister::register_mhc_pre_big_fuse_v4_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 0);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int const num_inputs = 5;
+  int const num_outputs = 3;
+  assert(bgraph.operators.size() == (size_t)(num_inputs + num_outputs));
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+
+  // gemm_out_mul: [N_SPLITS, num_tokens, HC_MULT3]
+  assert(input_ops[0]->dtensor.num_dims == 3);
+  int const n_splits = input_ops[0]->dtensor.dim[0];
+  int const total_tokens = input_ops[0]->dtensor.dim[1];
+  int const hc_mult3 = input_ops[0]->dtensor.dim[2];
+  // residual: [num_tokens, HC_MULT, HIDDEN]
+  assert(input_ops[4]->dtensor.num_dims == 3);
+  int const hc_mult = input_ops[4]->dtensor.dim[1];
+  int const hidden = input_ops[4]->dtensor.dim[2];
+  // Cross-check HC_MULT3 against HC_MULT * (2 + HC_MULT).
+  assert(hc_mult3 == hc_mult * (2 + hc_mult));
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  // SINKHORN_REPEAT=20, NUM_THREADS=256 match the V4-Flash spec.
+  // hc_pre_eps = hc_sinkhorn_eps = 1e-6; hc_post_alpha = 2.0; rms_eps = 1e-6.
+  // TOTAL_TOKENS is the parent T dim (stride between split-rows in the
+  // per-token pre-offset pointer).
+  code.e("kernel::mhc_pre_big_fuse_v4_sm100_impl<$, $, $, $, 20, 256>(",
+         hidden,
+         hc_mult,
+         n_splits,
+         total_tokens);
+  code.e("    task_desc->input_ptrs[0],");  // gemm_out_mul
+  code.e("    task_desc->input_ptrs[1],");  // gemm_out_sqrsum
+  code.e("    task_desc->input_ptrs[2],");  // hc_scale
+  code.e("    task_desc->input_ptrs[3],");  // hc_base
+  code.e("    task_desc->input_ptrs[4],");  // residual
+  code.e("    task_desc->output_ptrs[0],"); // post_mix
+  code.e("    task_desc->output_ptrs[1],"); // comb_mix
+  code.e("    task_desc->output_ptrs[2],"); // layer_input
+  code.e("    1e-6f,");                     // rms_eps
+  code.e("    1e-6f,");                     // hc_pre_eps
+  code.e("    1e-6f,");                     // hc_sinkhorn_eps
+  code.e("    2.0f);");                     // hc_post_alpha
+  return register_task_variant(TASK_MHC_PRE_BIG_FUSE_V4_SM100,
+                               code.to_string());
+}
+
+// ============================================================================
+// V4-Flash HC: mhc_pre_big_fuse_with_norm (naive SM100 integration)
+// ============================================================================
+// Spec: docs/mpk/deepseek_v4/vllm_kernels/mhc_pre_big_fuse_with_norm_tilelang.md
+//
+// TBGraph operator order (matches the Python catalog
+// mhc_pre_big_fuse_with_norm.py):
+//   inputs:
+//     [0] gemm_out_mul    fp32 [N_SPLITS, num_tokens, HC_MULT3]
+//     [1] gemm_out_sqrsum fp32 [N_SPLITS, num_tokens]
+//     [2] hc_scale        fp32 [3]
+//     [3] hc_base         fp32 [HC_MULT3]
+//     [4] residual        bf16 [num_tokens, HC_MULT, HIDDEN]
+//     [5] norm_weight     bf16 [HIDDEN]
+//   outputs:
+//     [0] post_mix        fp32 [num_tokens, HC_MULT]
+//     [1] comb_mix        fp32 [num_tokens, HC_MULT*HC_MULT]
+//     [2] layer_input     bf16 [num_tokens, HIDDEN]
+//
+// params: []. HIDDEN/HC_MULT/N_SPLITS derived from shapes.
+int TaskRegister::register_mhc_pre_big_fuse_with_norm_v4_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 0);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int const num_inputs = 6;
+  int const num_outputs = 3;
+  assert(bgraph.operators.size() == (size_t)(num_inputs + num_outputs));
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+
+  assert(input_ops[0]->dtensor.num_dims == 3);
+  int const n_splits = input_ops[0]->dtensor.dim[0];
+  int const total_tokens = input_ops[0]->dtensor.dim[1];
+  int const hc_mult3 = input_ops[0]->dtensor.dim[2];
+  assert(input_ops[4]->dtensor.num_dims == 3);
+  int const hc_mult = input_ops[4]->dtensor.dim[1];
+  int const hidden = input_ops[4]->dtensor.dim[2];
+  assert(hc_mult3 == hc_mult * (2 + hc_mult));
+  // norm_weight: [HIDDEN]
+  assert(input_ops[5]->dtensor.num_dims == 1);
+  assert(input_ops[5]->dtensor.dim[0] == hidden);
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e(
+      "kernel::mhc_pre_big_fuse_with_norm_v4_sm100_impl<$, $, $, $, 20, 256>(",
+      hidden,
+      hc_mult,
+      n_splits,
+      total_tokens);
+  code.e("    task_desc->input_ptrs[0],");  // gemm_out_mul
+  code.e("    task_desc->input_ptrs[1],");  // gemm_out_sqrsum
+  code.e("    task_desc->input_ptrs[2],");  // hc_scale
+  code.e("    task_desc->input_ptrs[3],");  // hc_base
+  code.e("    task_desc->input_ptrs[4],");  // residual
+  code.e("    task_desc->input_ptrs[5],");  // norm_weight
+  code.e("    task_desc->output_ptrs[0],"); // post_mix
+  code.e("    task_desc->output_ptrs[1],"); // comb_mix
+  code.e("    task_desc->output_ptrs[2],"); // layer_input
+  code.e("    1e-6f,");                     // rms_eps
+  code.e("    1e-6f,");                     // hc_pre_eps
+  code.e("    1e-6f,");                     // hc_sinkhorn_eps
+  code.e("    2.0f,");                      // hc_post_alpha
+  code.e("    1e-6f);");                    // norm_eps
+  return register_task_variant(TASK_MHC_PRE_BIG_FUSE_WITH_NORM_V4_SM100,
+                               code.to_string());
+}
+
+// ============================================================================
+// V4-Flash HC: mhc_fused (naive SM100 integration, decode regime)
+// ============================================================================
+// Spec: docs/mpk/deepseek_v4/vllm_kernels/mhc_fused_tilelang.md
+//
+// TBGraph operator order (matches the Python catalog mhc_fused.py):
+//   inputs:
+//     [0] comb_mix     fp32 [num_tokens, HC, HC]
+//     [1] residual_in  bf16 [num_tokens, HC, HIDDEN]
+//     [2] post_mix     fp32 [num_tokens, HC]
+//     [3] x_in         bf16 [num_tokens, HIDDEN]
+//     [4] weight_t     fp32 [N_OUT, HC, HIDDEN]
+//   outputs:
+//     [0] gemm_out_mul    fp32 [SPLIT_K=1, num_tokens, N_OUT]
+//     [1] gemm_out_sqrsum fp32 [SPLIT_K=1, num_tokens]
+//     [2] residual_out    bf16 [num_tokens, HC, HIDDEN]
+//
+// params: []. HC/HIDDEN/N_OUT derived from input shapes. SPLIT_K is
+// hard-coded to 1 in the naive impl.
+int TaskRegister::register_mhc_fused_v4_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 0);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int const num_inputs = 5;
+  int const num_outputs = 3;
+  assert(bgraph.operators.size() == (size_t)(num_inputs + num_outputs));
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+
+  // residual_in: [num_tokens, HC, HIDDEN]
+  assert(input_ops[1]->dtensor.num_dims == 3);
+  int const hc = input_ops[1]->dtensor.dim[1];
+  int const hidden = input_ops[1]->dtensor.dim[2];
+
+  // weight_t: [N_OUT, HC, HIDDEN]
+  assert(input_ops[4]->dtensor.num_dims == 3);
+  int const n_out = input_ops[4]->dtensor.dim[0];
+  assert(input_ops[4]->dtensor.dim[1] == hc);
+  assert(input_ops[4]->dtensor.dim[2] == hidden);
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::mhc_fused_v4_sm100_impl<$, $, $, 1, 256>(",
+         hc,
+         hidden,
+         n_out);
+  code.e("    task_desc->input_ptrs[0],");   // comb_mix
+  code.e("    task_desc->input_ptrs[1],");   // residual_in
+  code.e("    task_desc->input_ptrs[2],");   // post_mix
+  code.e("    task_desc->input_ptrs[3],");   // x_in
+  code.e("    task_desc->input_ptrs[4],");   // weight_t
+  code.e("    task_desc->output_ptrs[0],");  // gemm_out_mul
+  code.e("    task_desc->output_ptrs[1],");  // gemm_out_sqrsum
+  code.e("    task_desc->output_ptrs[2]);"); // residual_out
+  return register_task_variant(TASK_MHC_FUSED_V4_SM100, code.to_string());
+}
+
+// ============================================================================
+// V4-Flash HC GEMM + head kernels (naive SM100 integration)
+// ============================================================================
+// Decision (all four are NEW): the HC family is empty on this branch; no
+// existing task matches the dual (gemm_out, sqrsum) split-K fp32 contract.
+//
+// Three of the four (hc_prenorm_gemm, hc_prenorm_gemm_block_m,
+// tf32_hc_prenorm_gemm) share the SAME naive implementation at the
+// device level (see hc_prenorm_gemm_v4_sm100.cuh) -- they all produce
+// IDENTICAL outputs `(n_splits=1, T, HC_MULT3)` fp32 and
+// `(n_splits=1, T)` fp32. The three task-name registrations keep the
+// catalog parity with vLLM so downstream consumers stay verbatim.
+//
+// TBGraph operator order for all THREE GEMM variants (matches the
+// Python catalog):
+//   inputs:
+//     [0] x        bf16  [num_tokens, HC_MULT * HIDDEN]
+//     [1] fn       fp32  [HC_MULT3,   HC_MULT * HIDDEN]
+//   outputs:
+//     [0] gemm_out fp32  [1, num_tokens, HC_MULT3]
+//     [1] sqrsum   fp32  [1, num_tokens]
+//
+// HIDDEN and HC_MULT are derived from the bgraph tensor shapes.
+
+namespace {
+// Shared body for the three sibling GEMM variants. Reads dimensions
+// from the bgraph and emits the appropriate `kernel::<impl>(...)` call.
+int register_hc_prenorm_gemm_variant_shared(
+    threadblock::Graph const &bgraph,
+    std::vector<int> const &params,
+    char const *kernel_symbol,
+    mirage::runtime::TaskType task_type) {
+  assert(params.size() == 0);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int const num_inputs = 2;  // x, fn
+  int const num_outputs = 2; // gemm_out, sqrsum
+  assert(bgraph.operators.size() == (size_t)(num_inputs + num_outputs));
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+
+  // x is bf16 [T, K] where K = HC_MULT * HIDDEN.
+  assert(input_ops[0]->dtensor.num_dims == 2);
+  int const K = input_ops[0]->dtensor.dim[1];
+
+  // fn is fp32 [HC_MULT3, K]. HC_MULT3 = HC_MULT * (2 + HC_MULT).
+  assert(input_ops[1]->dtensor.num_dims == 2);
+  int const hc_mult3 = input_ops[1]->dtensor.dim[0];
+  assert(input_ops[1]->dtensor.dim[1] == K);
+
+  // gemm_out is fp32 [1, T, HC_MULT3]; sqrsum is fp32 [1, T].
+  assert(output_ops[0]->dtensor.num_dims == 3);
+  assert(output_ops[0]->dtensor.dim[0] == 1);
+  assert(output_ops[0]->dtensor.dim[2] == hc_mult3);
+  assert(output_ops[1]->dtensor.num_dims == 2);
+  assert(output_ops[1]->dtensor.dim[0] == 1);
+
+  // Recover HC_MULT and HIDDEN from K = HC_MULT*HIDDEN and
+  // HC_MULT3 = HC_MULT*(2+HC_MULT) by integer search.
+  int hc_mult = 0;
+  for (int candidate = 1; candidate * (2 + candidate) <= hc_mult3;
+       ++candidate) {
+    if (candidate * (2 + candidate) == hc_mult3) {
+      hc_mult = candidate;
+      break;
+    }
+  }
+  assert(hc_mult > 0 &&
+         "HC_MULT3 must equal HC_MULT*(2+HC_MULT) for an integer HC_MULT");
+  int const hidden = K / hc_mult;
+  assert(hc_mult * hidden == K);
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  // NUM_THREADS = 256 == Blackwell WORKER_NUM_THREADS.
+  code.e("kernel::$<$, $, 256>(", kernel_symbol, hc_mult, hidden);
+  code.e("    task_desc->input_ptrs[0],");   // x
+  code.e("    task_desc->input_ptrs[1],");   // fn
+  code.e("    task_desc->output_ptrs[0],");  // gemm_out
+  code.e("    task_desc->output_ptrs[1]);"); // sqrsum
+  return mirage::runtime::TaskRegister::get_instance()->register_task_variant(
+      task_type, code.to_string());
+}
+} // namespace
+
+int TaskRegister::register_hc_prenorm_gemm_v4_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  return register_hc_prenorm_gemm_variant_shared(
+      bgraph,
+      params,
+      "hc_prenorm_gemm_v4_sm100_impl",
+      TASK_HC_PRENORM_GEMM_V4_SM100);
+}
+
+int TaskRegister::register_hc_prenorm_gemm_block_m_v4_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  return register_hc_prenorm_gemm_variant_shared(
+      bgraph,
+      params,
+      "hc_prenorm_gemm_block_m_v4_sm100_impl",
+      TASK_HC_PRENORM_GEMM_BLOCK_M_V4_SM100);
+}
+
+int TaskRegister::register_tf32_hc_prenorm_gemm_v4_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  return register_hc_prenorm_gemm_variant_shared(
+      bgraph,
+      params,
+      "tf32_hc_prenorm_gemm_v4_sm100_impl",
+      TASK_TF32_HC_PRENORM_GEMM_V4_SM100);
+}
+
+// ----------------------------------------------------------------------------
+// hc_head_fuse_v4_sm100: terminal HC kernel collapsing [T, HC_MULT, H] -> [T, H]
+// ----------------------------------------------------------------------------
+// TBGraph operator order:
+//   inputs:
+//     [0] residual  bf16  [T, HC_MULT, HIDDEN]
+//     [1] fn        fp32  [HC_MULT, HC_MULT * HIDDEN]
+//     [2] hc_scale  fp32  [1]
+//     [3] hc_base   fp32  [HC_MULT]
+//   outputs:
+//     [0] out       bf16  [T, HIDDEN]
+int TaskRegister::register_hc_head_fuse_v4_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 0);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int const num_inputs = 4;
+  int const num_outputs = 1;
+  assert(bgraph.operators.size() == (size_t)(num_inputs + num_outputs));
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+
+  // residual is bf16 [T, HC_MULT, HIDDEN].
+  assert(input_ops[0]->dtensor.num_dims == 3);
+  int const hc_mult = input_ops[0]->dtensor.dim[1];
+  int const hidden = input_ops[0]->dtensor.dim[2];
+
+  // fn is fp32 [HC_MULT, HC_MULT * HIDDEN].
+  assert(input_ops[1]->dtensor.num_dims == 2);
+  assert(input_ops[1]->dtensor.dim[0] == hc_mult);
+  assert(input_ops[1]->dtensor.dim[1] == hc_mult * hidden);
+  // hc_base is fp32 [HC_MULT].
+  assert(input_ops[3]->dtensor.num_dims == 1);
+  assert(input_ops[3]->dtensor.dim[0] == hc_mult);
+  // out is bf16 [T, HIDDEN].
+  assert(output_ops[0]->dtensor.num_dims == 2);
+  assert(output_ops[0]->dtensor.dim[1] == hidden);
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  // NUM_THREADS = 256 == Blackwell WORKER_NUM_THREADS.
+  // eps = rms_norm_eps = 1e-6f; hc_eps = 1e-6f (V4-Flash defaults).
+  code.e("kernel::hc_head_fuse_v4_sm100_impl<$, $, 256>(", hc_mult, hidden);
+  code.e("    task_desc->input_ptrs[0],");  // residual
+  code.e("    task_desc->input_ptrs[1],");  // fn
+  code.e("    task_desc->input_ptrs[2],");  // hc_scale
+  code.e("    task_desc->input_ptrs[3],");  // hc_base
+  code.e("    task_desc->output_ptrs[0],"); // out
+  code.e("    1e-6f,");                     // rms_eps
+  code.e("    1e-6f);");                    // hc_eps
+  return register_task_variant(TASK_HC_HEAD_FUSE_V4_SM100, code.to_string());
+}
+
 } // namespace runtime
 } // namespace mirage

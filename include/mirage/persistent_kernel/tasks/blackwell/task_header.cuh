@@ -65,6 +65,22 @@
 #include "mla_reduce_sm100.cuh"
 #include "mla_sm100_2sm.cuh"
 #include "mla_unified_sm100.cuh"
+// V4-Flash HC kernels (naive Blackwell). Specs under
+// docs/mpk/deepseek_v4/vllm_kernels/{mhc_post,mhc_pre_big_fuse,
+// mhc_pre_big_fuse_with_norm,mhc_fused}_tilelang.md. The
+// with_norm header includes the no-norm header (sinkhorn_inplace),
+// so order is: base first, then derived.
+#include "mhc_pre_big_fuse_v4_sm100.cuh"
+#include "mhc_pre_big_fuse_with_norm_v4_sm100.cuh"
+#include "mhc_post_v4_sm100.cuh"
+#include "mhc_fused_v4_sm100.cuh"
+// V4-Flash HC GEMM + head kernels (naive Blackwell). The shared GEMM
+// impl header (hc_prenorm_gemm_v4_sm100.cuh) must precede the two thin
+// variants that delegate to it (block_m, tf32).
+#include "hc_prenorm_gemm_v4_sm100.cuh"
+#include "hc_prenorm_gemm_block_m_v4_sm100.cuh"
+#include "hc_head_fuse_v4_sm100.cuh"
+#include "tf32_hc_prenorm_gemm_v4_sm100.cuh"
 #include "moe_linear_sm100.cuh"
 #include "moe_permute_sm100.cuh"
 #include "moe_unpermute_sm100.cuh"
