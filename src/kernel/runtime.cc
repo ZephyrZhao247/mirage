@@ -2014,6 +2014,10 @@ TaskGraphResult print_task_graph(
   task_type_to_name[TASK_MOE_W2_FP8_SM100] = "TASK_MOE_W2_FP8_SM100";
   task_type_to_name[TASK_MOE_MUL_SUM_ADD_SM100] = "TASK_MOE_MUL_SUM_ADD_SM100";
   task_type_to_name[TASK_ELEMENTWISE_ADD_SM100] = "TASK_ELEMENTWISE_ADD_SM100";
+  // V4-Flash std-layer kernels (naive). Spec:
+  // docs/mpk/deepseek_v4/vllm_kernels/.
+  task_type_to_name[TASK_APPLY_ROTARY_EMB_V4_SM100] =
+      "TASK_APPLY_ROTARY_EMB_V4_SM100";
   task_type_to_name[TASK_SOFTMAX_GATHER_SM100] = "TASK_SOFTMAX_GATHER_SM100";
   task_type_to_name[TASK_MTP_VERIFY_PROBABILISTIC] =
       "TASK_MTP_VERIFY_PROBABILISTIC";

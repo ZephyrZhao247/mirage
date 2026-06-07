@@ -124,6 +124,10 @@ event_name_list = {
     315: "TASK_TRANSPOSE_SCALE_SM100",
     316: "TASK_ASSEMBLE_Q_DECODE_SM100",
     320: "TASK_SM100_TASK_END",
+    # V4-Flash std-layer kernels (naive). Spec at
+    # docs/mpk/deepseek_v4/vllm_kernels/. Enum slots from runtime_header.h
+    # (TASK_V4_TASK_BEGIN = 350).
+    351: "TASK_APPLY_ROTARY_EMB_V4_SM100",
 }
 
 
