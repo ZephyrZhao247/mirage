@@ -551,6 +551,11 @@ def main() -> None:
 
     # ---- 5. PersistentKernel ------------------------------------------
     num_workers, num_schedulers = mi.get_configurations_from_gpu(0)
+    profiler_tensor = None
+    if args.trace_name:
+        profiler_tensor = torch.zeros(
+            3000 * 128, dtype=torch.uint64, device="cuda"
+        ).contiguous()
     spec_decode_config = mi.mpk.spec_decode_class(None, 3, 5)
     eos = config.eos_token_id if not args.ignore_eos else -1
     if isinstance(eos, list):
@@ -586,7 +591,7 @@ def main() -> None:
             "paged_kv_indices_buffer": paged_kv_indices_buffer,
             "paged_kv_last_page_len_buffer": paged_kv_last_page_len_buffer,
         },
-        profiler_tensor=None,
+        profiler_tensor=profiler_tensor,
         trace_name=args.trace_name,
         spec_decode_config=spec_decode_config,
         use_cutlass_kernel=True,

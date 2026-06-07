@@ -184,16 +184,27 @@ def export_to_perfetto_trace(
     tgen = TraceGenerator(file_name)
 
     tid_map = {}
+    block_pid_map = {}
     track_map = {}
-    for block_idx in range(num_blocks):
-        pid = tgen.create_group(f"block_{block_idx}")
-        for group_idx in range(num_groups):
+
+    def _get_tid(block_idx, group_idx):
+        # Lazily create block/group groups: the header's num_blocks can
+        # under-count the worker blocks that actually emitted events, so
+        # build tracks on demand rather than from range(num_blocks).
+        key = (block_idx, group_idx)
+        tid = tid_map.get(key)
+        if tid is None:
+            pid = block_pid_map.get(block_idx)
+            if pid is None:
+                pid = tgen.create_group(f"block_{block_idx}")
+                block_pid_map[block_idx] = pid
             tid = pid.create_group(f"group_{group_idx}")
-            tid_map[(block_idx, group_idx)] = tid
+            tid_map[key] = tid
+        return tid
 
     for block_idx, group_idx, event_idx, event_no, event_type, timestamp in events:
         event = event_name_list.get(event_idx, f"UNKNOWN_{event_idx}") + f"_{event_no}"
-        tid = tid_map[(block_idx, group_idx)]
+        tid = _get_tid(block_idx, group_idx)
 
         if (block_idx, group_idx, event_idx) in track_map:
             track = track_map[(block_idx, group_idx, event_idx)]
