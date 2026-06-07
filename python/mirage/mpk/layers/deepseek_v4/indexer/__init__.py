@@ -23,12 +23,20 @@ are out of scope here. The two MQA-logits kernels are NAIVE one-CTA-
 per-Q-row (looping over kv); the production DeepGEMM kernel uses a
 persistent-grid + TMA + UMMA pipeline with warp specialization.
 """
+from .fused_kv_compress_norm_rope_insert_indexer_attn import (
+    V4FusedKVCompressNormRopeInsertIndexerAttn,
+)
+from .fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn import (
+    V4FusedKVCompressNormRopeInsertIndexerMxfp4Attn,
+)
 from .fused_indexer_q_rope_quant import V4FusedIndexerQRopeQuant
 from .fused_indexer_q_rope_mxfp4 import V4FusedIndexerQRopeMxfp4
 from .fp8_fp4_paged_mqa_logits import V4Fp8Fp4PagedMqaLogits
 from .fp8_fp4_mqa_logits import V4Fp8Fp4MqaLogits
 
 __all__ = [
+    "V4FusedKVCompressNormRopeInsertIndexerAttn",
+    "V4FusedKVCompressNormRopeInsertIndexerMxfp4Attn",
     "V4FusedIndexerQRopeQuant",
     "V4FusedIndexerQRopeMxfp4",
     "V4Fp8Fp4PagedMqaLogits",
