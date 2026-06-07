@@ -500,6 +500,18 @@ void register_mugraph(
               task.task_metadata.kv_idx = bid.y;
               task.task_metadata.merge_task_offset = bid.z;
             }
+            // V4-Flash MoE compute kernels: GEMM tile metadata.
+            //   fused_moe_kernel / gptq_awq / write_zeros: pid_m=bid.x,
+            //   pid_n=bid.y.  fp8_fp4_mega_moe: per-token grid (bid.x).
+            if (task_type == TASK_FUSED_MOE_KERNEL_V4_SM100 ||
+                task_type == TASK_FUSED_MOE_KERNEL_GPTQ_AWQ_V4_SM100 ||
+                task_type == TASK_WRITE_ZEROS_TO_OUTPUT_V4_SM100) {
+              task.task_metadata.request_id = bid.x; // pid_m
+              task.task_metadata.kv_idx = bid.y;     // pid_n
+            }
+            if (task_type == TASK_FP8_FP4_MEGA_MOE_V4_SM100) {
+              task.task_metadata.request_id = bid.x; // token index
+            }
             // FP8 dense + grouped GEMM: grid=(num_workers, 1, 1).
             // request_id is the worker index used by the persistent
             // tiling loop. Grouped variants share the same metadata
@@ -1983,6 +1995,66 @@ TaskGraphResult print_task_graph(
       "TASK_HC_HEAD_FUSE_V4_SM100";
   task_type_to_name[TASK_TF32_HC_PRENORM_GEMM_V4_SM100] =
       "TASK_TF32_HC_PRENORM_GEMM_V4_SM100";
+  // V4-Flash attention kernels (naive Blackwell).
+  task_type_to_name[TASK_FUSED_Q_KV_RMSNORM_V4_SM100] =
+      "TASK_FUSED_Q_KV_RMSNORM_V4_SM100";
+  task_type_to_name[TASK_FUSED_DSV4_QNORM_ROPE_KV_INSERT_V4_SM100] =
+      "TASK_FUSED_DSV4_QNORM_ROPE_KV_INSERT_V4_SM100";
+  task_type_to_name[TASK_FLASH_MLA_DECODE_V4_SM100] =
+      "TASK_FLASH_MLA_DECODE_V4_SM100";
+  task_type_to_name[TASK_FLASH_MLA_SPARSE_PREFILL_V4_SM100] =
+      "TASK_FLASH_MLA_SPARSE_PREFILL_V4_SM100";
+  task_type_to_name[TASK_FUSED_INV_ROPE_FP8_QUANT_V4_SM100] =
+      "TASK_FUSED_INV_ROPE_FP8_QUANT_V4_SM100";
+  // V4-Flash attention cache utilities + o-projection einsum.
+  task_type_to_name[TASK_QUANTIZE_AND_INSERT_K_V4_SM100] =
+      "TASK_QUANTIZE_AND_INSERT_K_V4_SM100";
+  task_type_to_name[TASK_DEQUANTIZE_AND_GATHER_K_V4_SM100] =
+      "TASK_DEQUANTIZE_AND_GATHER_K_V4_SM100";
+  task_type_to_name[TASK_COMPUTE_GLOBAL_TOPK_INDICES_V4_SM100] =
+      "TASK_COMPUTE_GLOBAL_TOPK_INDICES_V4_SM100";
+  task_type_to_name[TASK_COMBINE_TOPK_SWA_INDICES_V4_SM100] =
+      "TASK_COMBINE_TOPK_SWA_INDICES_V4_SM100";
+  task_type_to_name[TASK_DEEPSEEK_V4_FP8_EINSUM_V4_SM100] =
+      "TASK_DEEPSEEK_V4_FP8_EINSUM_V4_SM100";
+  // V4-Flash Compressor + Indexer K-side kernels (naive Blackwell).
+  task_type_to_name[TASK_SAVE_PARTIAL_STATES_V4_SM100] =
+      "TASK_SAVE_PARTIAL_STATES_V4_SM100";
+  task_type_to_name[TASK_FUSED_KV_COMPRESS_NORM_ROPE_INSERT_SPARSE_ATTN_V4_SM100] =
+      "TASK_FUSED_KV_COMPRESS_NORM_ROPE_INSERT_SPARSE_ATTN_V4_SM100";
+  task_type_to_name[TASK_FUSED_KV_COMPRESS_NORM_ROPE_INSERT_INDEXER_ATTN_V4_SM100] =
+      "TASK_FUSED_KV_COMPRESS_NORM_ROPE_INSERT_INDEXER_ATTN_V4_SM100";
+  task_type_to_name
+      [TASK_FUSED_KV_COMPRESS_NORM_ROPE_INSERT_INDEXER_MXFP4_ATTN_V4_SM100] =
+          "TASK_FUSED_KV_COMPRESS_NORM_ROPE_INSERT_INDEXER_MXFP4_ATTN_V4_SM100";
+  task_type_to_name[TASK_TOPK_SOFTPLUS_SQRT_V4_SM100] =
+      "TASK_TOPK_SOFTPLUS_SQRT_V4_SM100";
+  task_type_to_name[TASK_DSV3_ROUTER_GEMM_V4_SM100] =
+      "TASK_DSV3_ROUTER_GEMM_V4_SM100";
+  task_type_to_name[TASK_SILU_AND_MUL_WITH_CLAMP_V4_SM100] =
+      "TASK_SILU_AND_MUL_WITH_CLAMP_V4_SM100";
+  task_type_to_name[TASK_PREPARE_MEGAMOE_INPUTS_V4_SM100] =
+      "TASK_PREPARE_MEGAMOE_INPUTS_V4_SM100";
+  // V4-Flash indexer Q-side + MQA-logits kernels (naive Blackwell).
+  task_type_to_name[TASK_FUSED_INDEXER_Q_ROPE_QUANT_V4_SM100] =
+      "TASK_FUSED_INDEXER_Q_ROPE_QUANT_V4_SM100";
+  task_type_to_name[TASK_FUSED_INDEXER_Q_ROPE_MXFP4_V4_SM100] =
+      "TASK_FUSED_INDEXER_Q_ROPE_MXFP4_V4_SM100";
+  task_type_to_name[TASK_FP8_FP4_PAGED_MQA_LOGITS_V4_SM100] =
+      "TASK_FP8_FP4_PAGED_MQA_LOGITS_V4_SM100";
+  task_type_to_name[TASK_FP8_FP4_MQA_LOGITS_V4_SM100] =
+      "TASK_FP8_FP4_MQA_LOGITS_V4_SM100";
+  // V4-Flash MoE compute kernels (naive Blackwell).
+  task_type_to_name[TASK_FP8_FP4_MEGA_MOE_V4_SM100] =
+      "TASK_FP8_FP4_MEGA_MOE_V4_SM100";
+  task_type_to_name[TASK_FUSED_MOE_KERNEL_V4_SM100] =
+      "TASK_FUSED_MOE_KERNEL_V4_SM100";
+  task_type_to_name[TASK_FUSED_MOE_KERNEL_GPTQ_AWQ_V4_SM100] =
+      "TASK_FUSED_MOE_KERNEL_GPTQ_AWQ_V4_SM100";
+  task_type_to_name[TASK_WRITE_ZEROS_TO_OUTPUT_V4_SM100] =
+      "TASK_WRITE_ZEROS_TO_OUTPUT_V4_SM100";
+  task_type_to_name[TASK_MOE_ALIGN_BLOCK_SIZE_V4_SM100] =
+      "TASK_MOE_ALIGN_BLOCK_SIZE_V4_SM100";
   task_type_to_name[TASK_QUANTIZE_FP8_SM100] = "TASK_QUANTIZE_FP8_SM100";
   task_type_to_name[TASK_LINEAR_FP8_SM100] = "TASK_LINEAR_FP8_SM100";
   task_type_to_name[TASK_LINEAR_FP8_WITH_RESIDUAL_SM100] =

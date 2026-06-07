@@ -81,6 +81,68 @@
 #include "hc_prenorm_gemm_block_m_v4_sm100.cuh"
 #include "hc_head_fuse_v4_sm100.cuh"
 #include "tf32_hc_prenorm_gemm_v4_sm100.cuh"
+// V4-Flash attention kernels (naive Blackwell). Specs:
+//   docs/mpk/deepseek_v4/vllm_kernels/fused_q_kv_rmsnorm.md
+//   docs/mpk/deepseek_v4/vllm_kernels/fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert.md
+//   docs/mpk/deepseek_v4/vllm_kernels/flash_mla_with_kvcache.md
+//   docs/mpk/deepseek_v4/vllm_kernels/flash_mla_sparse_fwd.md
+//   docs/mpk/deepseek_v4/vllm_kernels/fused_inv_rope_fp8_quant.md
+#include "fused_q_kv_rmsnorm_v4_sm100.cuh"
+#include "fused_dsv4_qnorm_rope_kv_insert_v4_sm100.cuh"
+#include "flash_mla_with_kvcache_v4_sm100.cuh"
+#include "flash_mla_sparse_fwd_v4_sm100.cuh"
+#include "fused_inv_rope_fp8_quant_v4_sm100.cuh"
+// V4-Flash attention cache utilities + o-projection einsum (naive Blackwell).
+// Specs:
+//   docs/mpk/deepseek_v4/vllm_kernels/quantize_and_insert_k_kernel.md
+//   docs/mpk/deepseek_v4/vllm_kernels/dequantize_and_gather_k_kernel.md
+//   docs/mpk/deepseek_v4/vllm_kernels/compute_global_topk_indices_and_lens.md
+//   docs/mpk/deepseek_v4/vllm_kernels/combine_topk_swa_indices.md
+//   docs/mpk/deepseek_v4/vllm_kernels/deepseek_v4_fp8_einsum.md
+#include "quantize_and_insert_k_v4_sm100.cuh"
+#include "dequantize_and_gather_k_v4_sm100.cuh"
+#include "compute_global_topk_indices_v4_sm100.cuh"
+#include "combine_topk_swa_indices_v4_sm100.cuh"
+#include "deepseek_v4_fp8_einsum_v4_sm100.cuh"
+// V4-Flash Compressor + Indexer K-side kernels (naive Blackwell). Specs:
+//   docs/mpk/deepseek_v4/vllm_kernels/save_partial_states.md
+//   docs/mpk/deepseek_v4/vllm_kernels/fused_kv_compress_norm_rope_insert_sparse_attn.md
+//   docs/mpk/deepseek_v4/vllm_kernels/fused_kv_compress_norm_rope_insert_indexer_attn.md
+//   docs/mpk/deepseek_v4/vllm_kernels/fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn.md
+#include "save_partial_states_v4_sm100.cuh"
+#include "fused_kv_compress_norm_rope_insert_sparse_attn_v4_sm100.cuh"
+#include "fused_kv_compress_norm_rope_insert_indexer_attn_v4_sm100.cuh"
+#include "fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn_v4_sm100.cuh"
+// V4-Flash indexer Q-side + MQA-logits kernels (naive Blackwell). Specs:
+//   docs/mpk/deepseek_v4/vllm_kernels/fused_indexer_q_rope_quant.md
+//   docs/mpk/deepseek_v4/vllm_kernels/fused_indexer_q_rope_mxfp4.md
+//   docs/mpk/deepseek_v4/vllm_kernels/fp8_fp4_paged_mqa_logits.md
+//   docs/mpk/deepseek_v4/vllm_kernels/fp8_fp4_mqa_logits.md
+#include "fused_indexer_q_rope_quant_v4_sm100.cuh"
+#include "fused_indexer_q_rope_mxfp4_v4_sm100.cuh"
+#include "fp8_fp4_paged_mqa_logits_v4_sm100.cuh"
+#include "fp8_fp4_mqa_logits_v4_sm100.cuh"
+// V4-Flash MoE routing + activation + MegaMoE-prep kernels (naive Blackwell).
+// Specs:
+//   docs/mpk/deepseek_v4/vllm_kernels/topk_softplus_sqrt.md
+//   docs/mpk/deepseek_v4/vllm_kernels/dsv3_router_gemm.md
+//   docs/mpk/deepseek_v4/vllm_kernels/silu_and_mul_with_clamp.md
+//   docs/mpk/deepseek_v4/vllm_kernels/prepare_megamoe_inputs.md
+#include "topk_softplus_sqrt_v4_sm100.cuh"
+#include "dsv3_router_gemm_v4_sm100.cuh"
+#include "silu_and_mul_with_clamp_v4_sm100.cuh"
+#include "prepare_megamoe_inputs_v4_sm100.cuh"
+// V4-Flash MoE compute kernels (naive Blackwell). Specs:
+//   docs/mpk/deepseek_v4/vllm_kernels/fp8_fp4_mega_moe.md
+//   docs/mpk/deepseek_v4/vllm_kernels/fused_moe_kernel.md
+//   docs/mpk/deepseek_v4/vllm_kernels/fused_moe_kernel_gptq_awq.md
+//   docs/mpk/deepseek_v4/vllm_kernels/write_zeros_to_output.md
+//   docs/mpk/deepseek_v4/vllm_kernels/moe_align_block_size.md
+#include "fp8_fp4_mega_moe_v4_sm100.cuh"
+#include "fused_moe_kernel_v4_sm100.cuh"
+#include "fused_moe_kernel_gptq_awq_v4_sm100.cuh"
+#include "write_zeros_to_output_v4_sm100.cuh"
+#include "moe_align_block_size_v4_sm100.cuh"
 #include "moe_linear_sm100.cuh"
 #include "moe_permute_sm100.cuh"
 #include "moe_unpermute_sm100.cuh"

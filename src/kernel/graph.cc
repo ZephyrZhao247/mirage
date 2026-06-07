@@ -1115,6 +1115,271 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(4, 1, TASK_HC_HEAD_FUSE_V4_SM100, variant_id);
+  } else if (name == "silu_and_mul_with_clamp_v4_sm100") {
+    // V4-Flash MoE silu_and_mul_with_clamp (naive Blackwell). See
+    // docs/mpk/deepseek_v4/vllm_kernels/silu_and_mul_with_clamp.md.
+    // Inputs: gateup (bf16). Output: out (bf16). params[0] = swiglu_limit
+    // bitcast as int.
+    int variant_id =
+        task_register->register_silu_and_mul_with_clamp_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        1, 1, TASK_SILU_AND_MUL_WITH_CLAMP_V4_SM100, variant_id);
+  } else if (name == "dsv3_router_gemm_v4_sm100") {
+    // V4-Flash MoE dsv3_router_gemm (naive Blackwell). See
+    // docs/mpk/deepseek_v4/vllm_kernels/dsv3_router_gemm.md.
+    // Inputs: hidden_states (bf16), weight (bf16). Output: router_logits (fp32).
+    int variant_id = task_register->register_dsv3_router_gemm_v4_sm100_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(2, 1, TASK_DSV3_ROUTER_GEMM_V4_SM100, variant_id);
+  } else if (name == "topk_softplus_sqrt_v4_sm100") {
+    // V4-Flash MoE topk_softplus_sqrt (naive Blackwell). See
+    // docs/mpk/deepseek_v4/vllm_kernels/topk_softplus_sqrt.md.
+    // params[0] = use_hash. Scored branch: 2 inputs / 3 outputs.
+    // Hash branch: 3 inputs / 2 outputs.
+    int variant_id = task_register->register_topk_softplus_sqrt_v4_sm100_task(
+        customized->bgraph, params);
+    int num_inputs = params.size() >= 1 && params[0] != 0 ? 3 : 2;
+    int num_outputs = params.size() >= 1 && params[0] != 0 ? 2 : 3;
+    task_config[op] = std::make_tuple(
+        num_inputs, num_outputs, TASK_TOPK_SOFTPLUS_SQRT_V4_SM100, variant_id);
+  } else if (name == "prepare_megamoe_inputs_v4_sm100") {
+    // V4-Flash MegaMoE prep (naive Blackwell). See
+    // docs/mpk/deepseek_v4/vllm_kernels/prepare_megamoe_inputs.md.
+    // Inputs: hidden_states (bf16), topk_ids (int32), topk_weights (fp32).
+    // Outputs: x_fp8, x_sf (int32), topk_idx_out (int64), topk_weights_out (fp32).
+    int variant_id =
+        task_register->register_prepare_megamoe_inputs_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        3, 4, TASK_PREPARE_MEGAMOE_INPUTS_V4_SM100, variant_id);
+  } else if (name == "fused_indexer_q_rope_quant_v4_sm100") {
+    // V4-Flash indexer Q-side FP8 rope + quant + folded weights (naive
+    // Blackwell). See
+    // docs/mpk/deepseek_v4/vllm_kernels/fused_indexer_q_rope_quant.md.
+    // Inputs: q_in (bf16), cos_sin (fp32), weights_in (bf16).
+    // Outputs: q_out (fp8), weights_out (fp32).
+    int variant_id =
+        task_register->register_fused_indexer_q_rope_quant_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        3, 2, TASK_FUSED_INDEXER_Q_ROPE_QUANT_V4_SM100, variant_id);
+  } else if (name == "fused_indexer_q_rope_mxfp4_v4_sm100") {
+    // V4-Flash indexer Q-side MXFP4 rope + block-scaled quant (naive
+    // Blackwell). See
+    // docs/mpk/deepseek_v4/vllm_kernels/fused_indexer_q_rope_mxfp4.md.
+    // Inputs: q_in (bf16), cos_sin (fp32), weights_in (bf16).
+    // Outputs: q_packed (uint8), q_scale (uint8), weights_out (fp32).
+    int variant_id =
+        task_register->register_fused_indexer_q_rope_mxfp4_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        3, 3, TASK_FUSED_INDEXER_Q_ROPE_MXFP4_V4_SM100, variant_id);
+  } else if (name == "fp8_fp4_paged_mqa_logits_v4_sm100") {
+    // V4-Flash paged-MQA logits (FP8 path, naive Blackwell). See
+    // docs/mpk/deepseek_v4/vllm_kernels/fp8_fp4_paged_mqa_logits.md.
+    // Inputs: q (fp8), kv_cache (uint8), weights (fp32),
+    //         block_table (int32), context_lens (int32).
+    // Outputs: logits (fp32).
+    int variant_id =
+        task_register->register_fp8_fp4_paged_mqa_logits_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        5, 1, TASK_FP8_FP4_PAGED_MQA_LOGITS_V4_SM100, variant_id);
+  } else if (name == "fp8_fp4_mqa_logits_v4_sm100") {
+    // V4-Flash non-paged MQA logits prefill (FP8 path, naive Blackwell). See
+    // docs/mpk/deepseek_v4/vllm_kernels/fp8_fp4_mqa_logits.md.
+    // Inputs: q (fp8), k_packed (fp8), k_scales (fp32), weights (fp32),
+    //         cu_seqlen_ks (int32), cu_seqlen_ke (int32).
+    // Outputs: logits (fp32).
+    int variant_id =
+        task_register->register_fp8_fp4_mqa_logits_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        6, 1, TASK_FP8_FP4_MQA_LOGITS_V4_SM100, variant_id);
+  } else if (name == "save_partial_states_v4_sm100") {
+    // V4-Flash compressor save_partial_states (naive Blackwell). See
+    // docs/mpk/deepseek_v4/vllm_kernels/save_partial_states.md.
+    // Inputs: kv (fp32), score (fp32), ape (fp32), positions (int64),
+    //         slot_mapping (int64). Output: state_cache (fp32, in-place).
+    int variant_id =
+        task_register->register_save_partial_states_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(5, 1, TASK_SAVE_PARTIAL_STATES_V4_SM100, variant_id);
+  } else if (name == "fused_kv_compress_norm_rope_insert_sparse_attn_v4_sm100") {
+    // V4-Flash sparse-attn compressor (HEAD=512, naive Blackwell). See
+    // docs/mpk/deepseek_v4/vllm_kernels/fused_kv_compress_norm_rope_insert_sparse_attn.md.
+    // Inputs: state_cache, token_to_req_indices, positions, slot_mapping,
+    //         block_table, rms_norm_weight, cos_sin_cache, kv_slot_mapping.
+    // Outputs: k_cache (in-place, FP8 + bf16 RoPE + UE8M0 scales).
+    // params[0] = COMPRESS_RATIO (4 or 128).
+    int variant_id = task_register->
+        register_fused_kv_compress_norm_rope_insert_sparse_attn_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        8, 1, TASK_FUSED_KV_COMPRESS_NORM_ROPE_INSERT_SPARSE_ATTN_V4_SM100,
+        variant_id);
+  } else if (name == "fused_kv_compress_norm_rope_insert_indexer_attn_v4_sm100") {
+    // V4-Flash indexer compressor FP8 K-side (HEAD=128, naive Blackwell).
+    // Class-B sibling under use_fp4_cache=False. See
+    // docs/mpk/deepseek_v4/vllm_kernels/fused_kv_compress_norm_rope_insert_indexer_attn.md.
+    // Same TBGraph op-order as the sparse-attn sibling.
+    int variant_id = task_register->
+        register_fused_kv_compress_norm_rope_insert_indexer_attn_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        8, 1, TASK_FUSED_KV_COMPRESS_NORM_ROPE_INSERT_INDEXER_ATTN_V4_SM100,
+        variant_id);
+  } else if (name ==
+             "fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn_v4_sm100") {
+    // V4-Flash indexer compressor MXFP4 K-side (HEAD=128, naive Blackwell).
+    // Class-B sibling under use_fp4_cache=True. See
+    // docs/mpk/deepseek_v4/vllm_kernels/fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn.md.
+    int variant_id = task_register->
+        register_fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        8, 1,
+        TASK_FUSED_KV_COMPRESS_NORM_ROPE_INSERT_INDEXER_MXFP4_ATTN_V4_SM100,
+        variant_id);
+  } else if (name == "fp8_fp4_mega_moe_v4_sm100") {
+    // V4-Flash naive MegaMoE port (bf16 weights). See
+    // docs/mpk/deepseek_v4/vllm_kernels/fp8_fp4_mega_moe.md.
+    // Inputs: A (bf16 [T, H]), W13 (bf16 [E, 2I, H]),
+    //         W2 (bf16 [E, H, I]), topk_idx (int64 [T, K]),
+    //         topk_w (fp32 [T, K]).
+    // Outputs: y (bf16 [T, H]).
+    int variant_id = task_register->register_fp8_fp4_mega_moe_v4_sm100_task(
+        customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        5, 1, TASK_FP8_FP4_MEGA_MOE_V4_SM100, variant_id);
+  } else if (name == "fused_moe_kernel_v4_sm100") {
+    // V4-Flash fused MoE GEMM (bf16 W/A). See
+    // docs/mpk/deepseek_v4/vllm_kernels/fused_moe_kernel.md.
+    // Inputs: A, B, sorted_token_ids, expert_ids, num_tokens_post_pad,
+    //         topk_weights. Outputs: C (bf16 [T, K_topk, N]).
+    int variant_id = task_register->register_fused_moe_kernel_v4_sm100_task(
+        customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        6, 1, TASK_FUSED_MOE_KERNEL_V4_SM100, variant_id);
+  } else if (name == "fused_moe_kernel_gptq_awq_v4_sm100") {
+    // V4-Flash fused MoE GEMM with W8A16 dequant. See
+    // docs/mpk/deepseek_v4/vllm_kernels/fused_moe_kernel_gptq_awq.md.
+    int variant_id =
+        task_register->register_fused_moe_kernel_gptq_awq_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        8, 1, TASK_FUSED_MOE_KERNEL_GPTQ_AWQ_V4_SM100, variant_id);
+  } else if (name == "write_zeros_to_output_v4_sm100") {
+    // V4-Flash FusedMoE -1-expert C-tile zero-fill. See
+    // docs/mpk/deepseek_v4/vllm_kernels/write_zeros_to_output.md.
+    int variant_id =
+        task_register->register_write_zeros_to_output_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        3, 1, TASK_WRITE_ZEROS_TO_OUTPUT_V4_SM100, variant_id);
+  } else if (name == "moe_align_block_size_v4_sm100") {
+    // V4-Flash whole-batch bin-by-expert + pad-to-block_size. See
+    // docs/mpk/deepseek_v4/vllm_kernels/moe_align_block_size.md.
+    int variant_id =
+        task_register->register_moe_align_block_size_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        1, 3, TASK_MOE_ALIGN_BLOCK_SIZE_V4_SM100, variant_id);
+  } else if (name == "fused_q_kv_rmsnorm_v4_sm100") {
+    // V4-Flash joint Q/KV RMSNorm (naive Blackwell). See
+    // docs/mpk/deepseek_v4/vllm_kernels/fused_q_kv_rmsnorm.md.
+    // Inputs: qr, q_weight, kv, kv_weight. Outputs: qr_out, kv_out.
+    int variant_id = task_register->register_fused_q_kv_rmsnorm_v4_sm100_task(
+        customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        4, 2, TASK_FUSED_Q_KV_RMSNORM_V4_SM100, variant_id);
+  } else if (name == "fused_dsv4_qnorm_rope_kv_insert_v4_sm100") {
+    // V4-Flash monolithic 5-op fusion (naive Blackwell). See
+    // docs/mpk/deepseek_v4/vllm_kernels/fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert.md.
+    // Inputs: q_in, kv_in, slot_mapping (int64), positions (int64),
+    //         cos_sin_cache (fp32). Outputs: q_out, k_cache (uint8 paged).
+    int variant_id =
+        task_register->register_fused_dsv4_qnorm_rope_kv_insert_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        5, 2, TASK_FUSED_DSV4_QNORM_ROPE_KV_INSERT_V4_SM100, variant_id);
+  } else if (name == "flash_mla_decode_v4_sm100") {
+    // V4-Flash naive sparse-MLA decode. See
+    // docs/mpk/deepseek_v4/vllm_kernels/flash_mla_with_kvcache.md.
+    // Inputs: q (bf16), k_cache (uint8 paged), indices (int32),
+    //         topk_length (int32), attn_sink (fp32). Outputs: out (bf16).
+    int variant_id = task_register->register_flash_mla_decode_v4_sm100_task(
+        customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        5, 1, TASK_FLASH_MLA_DECODE_V4_SM100, variant_id);
+  } else if (name == "flash_mla_sparse_prefill_v4_sm100") {
+    // V4-Flash naive sparse-MLA prefill. See
+    // docs/mpk/deepseek_v4/vllm_kernels/flash_mla_sparse_fwd.md.
+    // Inputs: q, kv (gathered bf16), indices, topk_length, attn_sink.
+    // Outputs: out (bf16).
+    int variant_id =
+        task_register->register_flash_mla_sparse_prefill_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        5, 1, TASK_FLASH_MLA_SPARSE_PREFILL_V4_SM100, variant_id);
+  } else if (name == "fused_inv_rope_fp8_quant_v4_sm100") {
+    // V4-Flash inverse-RoPE + UE8M0 FP8 block quant (naive Blackwell). See
+    // docs/mpk/deepseek_v4/vllm_kernels/fused_inv_rope_fp8_quant.md.
+    // Inputs: o (bf16), positions (int64), cos_sin_cache (fp32).
+    // Outputs: o_fp8 (uint8 = e4m3 raw bytes), o_scale (int32 packed UE8M0).
+    int variant_id =
+        task_register->register_fused_inv_rope_fp8_quant_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        3, 2, TASK_FUSED_INV_ROPE_FP8_QUANT_V4_SM100, variant_id);
+  } else if (name == "quantize_and_insert_k_v4_sm100") {
+    // V4-Flash quantize_and_insert_k (naive Blackwell). See
+    // docs/mpk/deepseek_v4/vllm_kernels/quantize_and_insert_k_kernel.md.
+    // Inputs: k (bf16 [T,512]), slot_mapping (int64 [T]).
+    // Outputs: k_cache (uint8, in-place).
+    int variant_id =
+        task_register->register_quantize_and_insert_k_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        2, 1, TASK_QUANTIZE_AND_INSERT_K_V4_SM100, variant_id);
+  } else if (name == "dequantize_and_gather_k_v4_sm100") {
+    // V4-Flash dequantize_and_gather_k (Triton variant; naive Blackwell). See
+    // docs/mpk/deepseek_v4/vllm_kernels/dequantize_and_gather_k_kernel.md.
+    // CuteDSL sibling is the locked alternative (pointer only).
+    // Inputs: k_cache, seq_lens, gather_lens, block_table.
+    // Outputs: out (bf16 [num_reqs, max_num_tokens, 576]).
+    int variant_id =
+        task_register->register_dequantize_and_gather_k_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        4, 1, TASK_DEQUANTIZE_AND_GATHER_K_V4_SM100, variant_id);
+  } else if (name == "compute_global_topk_indices_v4_sm100") {
+    // V4-Flash compute_global_topk_indices_and_lens (naive Blackwell). See
+    // docs/mpk/deepseek_v4/vllm_kernels/compute_global_topk_indices_and_lens.md.
+    int variant_id =
+        task_register->register_compute_global_topk_indices_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        4, 2, TASK_COMPUTE_GLOBAL_TOPK_INDICES_V4_SM100, variant_id);
+  } else if (name == "combine_topk_swa_indices_v4_sm100") {
+    // V4-Flash combine_topk_swa_indices (naive Blackwell). See
+    // docs/mpk/deepseek_v4/vllm_kernels/combine_topk_swa_indices.md.
+    int variant_id =
+        task_register->register_combine_topk_swa_indices_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        4, 2, TASK_COMBINE_TOPK_SWA_INDICES_V4_SM100, variant_id);
+  } else if (name == "deepseek_v4_fp8_einsum_v4_sm100") {
+    // V4-Flash o-projection FP8 einsum "bhr,hdr->bhd" (naive Blackwell). See
+    // docs/mpk/deepseek_v4/vllm_kernels/deepseek_v4_fp8_einsum.md.
+    int variant_id =
+        task_register->register_deepseek_v4_fp8_einsum_v4_sm100_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        4, 1, TASK_DEEPSEEK_V4_FP8_EINSUM_V4_SM100, variant_id);
   }
   // Multi-GPU tasks
   else if (name == "nvshmem_allgather_strided_put") {

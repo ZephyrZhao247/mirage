@@ -272,6 +272,97 @@ public:
       threadblock::Graph const &bgraph, std::vector<int> const &params);
   int register_tf32_hc_prenorm_gemm_v4_sm100_task(
       threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // V4-Flash attention kernels (SM100, naive integration). Specs:
+  //   docs/mpk/deepseek_v4/vllm_kernels/fused_q_kv_rmsnorm.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/flash_mla_with_kvcache.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/flash_mla_sparse_fwd.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/fused_inv_rope_fp8_quant.md
+  int register_fused_q_kv_rmsnorm_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_fused_dsv4_qnorm_rope_kv_insert_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_flash_mla_decode_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_flash_mla_sparse_prefill_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_fused_inv_rope_fp8_quant_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // V4-Flash attention cache utilities + o-projection einsum (SM100, naive).
+  // Specs:
+  //   docs/mpk/deepseek_v4/vllm_kernels/quantize_and_insert_k_kernel.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/dequantize_and_gather_k_kernel.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/compute_global_topk_indices_and_lens.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/combine_topk_swa_indices.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/deepseek_v4_fp8_einsum.md
+  int register_quantize_and_insert_k_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_dequantize_and_gather_k_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_compute_global_topk_indices_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_combine_topk_swa_indices_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_deepseek_v4_fp8_einsum_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // V4-Flash Compressor + Indexer K-side kernels (SM100, naive). Specs:
+  //   docs/mpk/deepseek_v4/vllm_kernels/save_partial_states.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/fused_kv_compress_norm_rope_insert_sparse_attn.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/fused_kv_compress_norm_rope_insert_indexer_attn.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn.md
+  // The indexer FP8 / MXFP4 pair is Class B: both K-side and Q-side
+  // toggle together under attention_config.use_fp4_indexer_cache.
+  int register_save_partial_states_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_fused_kv_compress_norm_rope_insert_sparse_attn_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_fused_kv_compress_norm_rope_insert_indexer_attn_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // V4-Flash indexer Q-side + MQA-logits kernels (SM100, naive). Specs:
+  //   docs/mpk/deepseek_v4/vllm_kernels/fused_indexer_q_rope_quant.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/fused_indexer_q_rope_mxfp4.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/fp8_fp4_paged_mqa_logits.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/fp8_fp4_mqa_logits.md
+  int register_fused_indexer_q_rope_quant_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_fused_indexer_q_rope_mxfp4_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_fp8_fp4_paged_mqa_logits_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_fp8_fp4_mqa_logits_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // V4-Flash MoE routing + activation + MegaMoE-prep kernels (SM100, naive).
+  // Specs:
+  //   docs/mpk/deepseek_v4/vllm_kernels/topk_softplus_sqrt.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/dsv3_router_gemm.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/silu_and_mul_with_clamp.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/prepare_megamoe_inputs.md
+  int register_topk_softplus_sqrt_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_dsv3_router_gemm_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_silu_and_mul_with_clamp_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_prepare_megamoe_inputs_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // V4-Flash MoE compute kernels (SM100, naive). Specs:
+  //   docs/mpk/deepseek_v4/vllm_kernels/fp8_fp4_mega_moe.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/fused_moe_kernel.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/fused_moe_kernel_gptq_awq.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/write_zeros_to_output.md
+  //   docs/mpk/deepseek_v4/vllm_kernels/moe_align_block_size.md
+  int register_fp8_fp4_mega_moe_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_fused_moe_kernel_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_fused_moe_kernel_gptq_awq_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_write_zeros_to_output_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_moe_align_block_size_v4_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
   // SM100 tasks end
   // Multi-GPU tasks
   int register_nvshmem_allgather_strided_put_task(
