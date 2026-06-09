@@ -1948,7 +1948,13 @@ __host__ inline void fill_tma_desc_by_task(CUtensorMap *tma_desc,
         // Reinterpret it as [MBT * H, D_K] for TMA so the box height matches
         // the kernel's hpb rows. This mirrors the TP2/4/8 descriptor path.
         constexpr int D_K = 576;
-        int const total_elements = tensor_desc.dim[0] * tensor_desc.dim[1];
+        // Q may be flat [MBT, H*D_K] (2D) or per-head [MBT, H, D_K] (3D, when
+        // the upstream q_b GEMM emits the BMM layout). Fold dim[2] in so
+        // total_rows is correct for either form (mirrors the TP2/4/8 path).
+        int total_elements = tensor_desc.dim[0] * tensor_desc.dim[1];
+        if (tensor_desc.num_dims == 3) {
+          total_elements *= tensor_desc.dim[2];
+        }
         int total_rows = total_elements / D_K; // B * Q_LEN * NUM_HEADS
         int d_k = D_K;
         int k_iters = d_k / BK;

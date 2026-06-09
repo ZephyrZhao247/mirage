@@ -54,7 +54,14 @@ static constexpr int TILE_BYTES = 128 * BK * 2;
 // Reduce constants
 static constexpr int RD_DV = 4;
 static constexpr int RD_TB = 512;
-static constexpr int MAX_SK = 32;
+// la_smem static = MAX_SK*128*4 bytes. At 32 this is 16KB of static smem,
+// which (with the worker's other static + the 221KB MAX_DYNAMIC_SHARED_MEMORY
+// budget) exceeds the B200 232448B per-block optin limit, so cudaFuncSetAttribute
+// silently fails and worker_kernel never launches -> persistent-kernel deadlock.
+// 8 keeps la_smem at 4KB so it fits. Caps absorbed split-K decode at 8 splits
+// (~1024-token context); for longer context, move la_smem into the dynamic
+// (extern) smem pool instead of raising this back up.
+static constexpr int MAX_SK = 8;
 
 // SMEM for main kernel
 // +1024 because the runtime rounds the extern shared-memory base up to a

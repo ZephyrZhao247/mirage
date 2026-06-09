@@ -132,15 +132,18 @@ __device__ __forceinline__ void topk_sigmoid_task_impl(
     int const start_expert,
     int const end_expert,
     float const routed_scaling_factor,
-    int const num_active_rows) { // runtime active token count
-                                 // (<= num_rows); compute (Phase 1+)
-                                 // only iterates over [0, num_active_rows).
-                                 // Phase 0 init still zeros the full
-                                 // [0, num_rows) range so padded slots
-                                 // in routing_indices stay 0 for the
-                                 // downstream moe_permute scan. For
-                                 // decode this drops the compute from
-                                 // ~108 μs (full mbt=128) to ~1 μs.
+    int const num_active_rows,   // runtime active token count (<= num_rows);
+                                 // compute (Phase 1+) iterates [0,
+                                 // num_active_rows). Phase 0 still zeros the
+                                 // full [0, num_rows) range so padded routing
+                                 // slots stay 0 for downstream moe_permute.
+    // cta_idx / num_ctas: logical task-instance index and count for the row-
+    // chunk loop. Under MPK blockIdx.x is the WORKER id (persistent_kernel.cuh:
+    // `worker_id = blockIdx.x`), NOT a task-grid index — so the chunk index
+    // must come from task_metadata.request_id (= bid.x), wired in runtime.cc.
+    // The single-CTA path passes cta_idx=0, num_ctas=1.
+    int const cta_idx,
+    int const num_ctas) {
 
   // Pointers
   T *input = static_cast<T *>(input_ptr);
@@ -240,13 +243,17 @@ __device__ __forceinline__ void topk_sigmoid_task_impl(
   // makes downstream moe_permute's `slot_1idx > 0` check correctly
   // treat them as "no routing".
   //
-  // Grid-stride over row-chunks. FUSE_COMPACTION=true + grid=(1,1,1) (the
-  // decode / default path) reduces exactly to the original single-CTA loop
-  // (blockIdx.x=0, gridDim.x=1 ⇒ row_base=0; +=ROWS_PER_CTA). The multi-CTA
-  // prefill path (FUSE_COMPACTION=false, grid of N CTAs) distributes the
-  // chunks across CTAs so the ~0.7 μs/row serial cost parallelizes.
-  for (int row_base = blockIdx.x * ROWS_PER_CTA; row_base < num_active_rows;
-       row_base += gridDim.x * ROWS_PER_CTA) {
+  // Row-chunk loop, distributed across logical task instances. `cta_idx` /
+  // `num_ctas` are the task-instance index and count (from task_metadata, NOT
+  // blockIdx — under MPK blockIdx.x is the worker id, so a blockIdx-strided
+  // start would skip every row whenever the task lands on a worker != 0,
+  // emitting all-zero routing). FUSE_COMPACTION=true (decode/default) runs a
+  // single instance (cta_idx=0, num_ctas=1) ⇒ one CTA strides all chunks from
+  // 0, exactly like topk_softmax. FUSE_COMPACTION=false (multi-CTA prefill)
+  // runs num_ctas instances, each owning a disjoint set of row-chunks; a
+  // separate compaction task aggregates markers afterward.
+  for (int row_base = cta_idx * ROWS_PER_CTA; row_base < num_active_rows;
+       row_base += num_ctas * ROWS_PER_CTA) {
     // Multi-CTA path only: zero THIS chunk's slice of the routing buffer
     // (rows [row_base, row_hi) across all local experts) before computing it.
     // Single-CTA path did this upfront in Phase 0; here it must be per-chunk
@@ -263,16 +270,19 @@ __device__ __forceinline__ void topk_sigmoid_task_impl(
       __syncthreads();
     }
     int const thread_row = row_base + warp_base_row + thread_row_in_warp;
-    // Warp mask: special case is for the THREADS_PER_ROW=16 / 2-rows-per-
-    // warp config where the last (odd) row's upper half-warp needs masking.
-    // Keep using `num_rows` (= compile-time MBT, the stride dim) here, not
-    // `num_active_rows` — with `num_active_rows=1` and full-warp rows
-    // (THREADS_PER_ROW=32 as in DSv3) the `% 2` check would spuriously
-    // produce 0x0000ffff and break __shfl_sync below by leaving lanes
-    // 16..31 outside the mask while they still execute the shuffle.
-    uint32_t const warp_mask = (num_rows % 2 == 1 && thread_row == num_rows - 1)
-                                   ? 0x0000ffff
-                                   : 0xffffffff;
+    // Warp mask: the __shfl_*_sync calls below run ONLY for lanes that enter
+    // the `if (thread_row < num_active_rows)` block, but they name a mask of
+    // lanes that must all reach the shuffle. When a warp covers more rows than
+    // are active (ROWS_PER_WARP > active rows in this warp, e.g. decode/small
+    // MBT with THREADS_PER_ROW=2 ⇒ 16 rows/warp but only 4 active), lanes for
+    // inactive rows skip the `if`, so a 0xffffffff mask deadlocks the shuffle.
+    // Derive the mask via a full-warp ballot of exactly the active-row
+    // predicate. A row's THREADS_PER_ROW lanes share one `thread_row`, so each
+    // shuffle width-subgroup is wholly in or out of the mask — making it valid
+    // for every layout (THREADS_PER_ROW = 2, 16, 32, …). The ballot must be
+    // computed by the FULL warp before the divergent branch.
+    uint32_t const warp_mask =
+        __ballot_sync(0xffffffff, thread_row < num_active_rows);
 
     if (thread_row < num_active_rows) {
 
